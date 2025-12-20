@@ -1,0 +1,8 @@
+[package]
+name = "asr-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+whisper-rs = { version = "0.12", features = ["whisper-cpp-log"] }
+thiserror = "1.0"

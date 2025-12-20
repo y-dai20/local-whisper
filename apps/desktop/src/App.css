@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+body {
+  background-color: #0f0f23;
+  color: rgb(226 232 240);
+  overflow: hidden;
+}
+
+.mic-button-pulse {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.transcription-slide-in {
+  animation: slideIn 0.3s ease;
+}
+
+.spinner {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 8px 24px rgba(239, 68, 68, 0.3);
+  }
+  50% {
+    box-shadow: 0 8px 32px rgba(239, 68, 68, 0.6);
+  }
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

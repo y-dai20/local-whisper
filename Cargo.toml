@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/asr-core",
+    "apps/desktop/src-tauri",
+]
+resolver = "2"
+
+[workspace.dependencies]
+asr-core = { path = "crates/asr-core" }
