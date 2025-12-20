@@ -16,12 +16,15 @@ struct RecordingState {
     audio_buffer: Vec<f32>,
     sample_rate: u32,
     selected_device_name: Option<String>,
+    recording_id: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct TranscriptionSegment {
     text: String,
     timestamp: u64,
+    #[serde(rename = "audioData")]
+    audio_data: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,6 +125,7 @@ async fn transcribe_audio(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64,
+                audio_data: Some(audio_data.clone()),
             };
 
             let _ = app_handle.emit("transcription-segment", &segment);
@@ -162,6 +166,7 @@ async fn transcribe_audio_stream(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
+            audio_data: Some(audio_f32.clone()),
         };
         let _ = app_handle.emit("transcription-segment", &segment);
     })
@@ -178,15 +183,26 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
             audio_buffer: Vec::new(),
             sample_rate: 16000,
             selected_device_name: None,
+            recording_id: 0,
         }))
     });
 
-    let mut state_guard = state.lock();
-    if state_guard.is_recording {
-        return Err("Already recording".to_string());
+    let (selected_device_name, current_recording_id);
+    {
+        let mut state_guard = state.lock();
+        if state_guard.is_recording {
+            return Err("Already recording".to_string());
+        }
+
+        // Increment recording ID to invalidate old callbacks
+        state_guard.recording_id = state_guard.recording_id.wrapping_add(1);
+        current_recording_id = state_guard.recording_id;
+
+        selected_device_name = state_guard.selected_device_name.clone();
+
+        let now = chrono::Local::now();
+        println!("[{}] Starting recording #{}", now.format("%H:%M:%S"), current_recording_id);
     }
-    let selected_device_name = state_guard.selected_device_name.clone();
-    drop(state_guard);
 
     let host = cpal::default_host();
 
@@ -230,131 +246,109 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
     println!("[{}] Recording config - Device sample rate: {}, Channels: {}, Format: {:?}",
              now.format("%H:%M:%S"), device_sample_rate, channels, config.sample_format());
 
-    let mut state_guard = state.lock();
-    state_guard.is_recording = true;
-    state_guard.audio_buffer.clear();
-    state_guard.sample_rate = device_sample_rate;
-    drop(state_guard);
+    // Build stream with recording ID check to prevent old callbacks from writing
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => {
+            let state_clone = state.clone();
+            let callback_count = Arc::new(ParkingMutex::new(0u64));
+            let zero_chunk_count = Arc::new(ParkingMutex::new(0u64));
+            let logged_non_zero = Arc::new(ParkingMutex::new(false));
 
-    let state_clone = state.clone();
-    let state_clone_for_thread = state.clone();
-    let err_fn = |err| eprintln!("Error in audio stream: {}", err);
-
-    std::thread::spawn(move || {
-        let callback_count = Arc::new(ParkingMutex::new(0u64));
-        let zero_chunk_count = Arc::new(ParkingMutex::new(0u64));
-        let logged_non_zero = Arc::new(ParkingMutex::new(false));
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => {
-                let callback_count_clone = callback_count.clone();
-                let zero_chunk_count_clone = zero_chunk_count.clone();
-                let logged_non_zero_clone = logged_non_zero.clone();
-                device.build_input_stream(
-                    &config.into(),
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        let mut state = state_clone.lock();
-                        if state.is_recording {
-                            for &sample in data.iter().step_by(channels) {
-                                state.audio_buffer.push(sample);
-                            }
-                            let chunk_max = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                            if chunk_max == 0.0 {
-                                let mut zero_count = zero_chunk_count_clone.lock();
-                                *zero_count += 1;
-                                if *zero_count <= 5 {
-                                    let now = chrono::Local::now();
-                                    println!(
-                                        "[{}] Audio callback chunk all zeros (count #{}, {} samples)",
-                                        now.format("%H:%M:%S"),
-                                        *zero_count,
-                                        data.len()
-                                    );
-                                }
-                            } else {
-                                let mut logged_non_zero_guard = logged_non_zero_clone.lock();
-                                if !*logged_non_zero_guard {
-                                    *logged_non_zero_guard = true;
-                                    let now = chrono::Local::now();
-                                    let preview: Vec<String> = data.iter().take(10).map(|v| format!("{:.4}", v)).collect();
-                                    println!(
-                                        "[{}] First non-zero chunk detected: max {:.4}, preview [{}]",
-                                        now.format("%H:%M:%S"),
-                                        chunk_max,
-                                        preview.join(" ")
-                                    );
-                                }
-                            }
-                            let mut count = callback_count_clone.lock();
-                            *count += 1;
-                            if *count % 100 == 0 {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut state = state_clone.lock();
+                    if state.is_recording && state.recording_id == current_recording_id {
+                        for &sample in data.iter().step_by(channels) {
+                            state.audio_buffer.push(sample);
+                        }
+                        let chunk_max = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                        if chunk_max == 0.0 {
+                            let mut zero_count = zero_chunk_count.lock();
+                            *zero_count += 1;
+                            if *zero_count <= 5 {
                                 let now = chrono::Local::now();
-                                println!("[{}] Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
-                                         now.format("%H:%M:%S"), *count, data.len(),
-                                         state.audio_buffer.len(), state.audio_buffer.len() as f32 / device_sample_rate as f32);
+                                println!(
+                                    "[{}] Audio callback chunk all zeros (count #{}, {} samples)",
+                                    now.format("%H:%M:%S"),
+                                    *zero_count,
+                                    data.len()
+                                );
+                            }
+                        } else {
+                            let mut logged_non_zero_guard = logged_non_zero.lock();
+                            if !*logged_non_zero_guard {
+                                *logged_non_zero_guard = true;
+                                let now = chrono::Local::now();
+                                let preview: Vec<String> = data.iter().take(10).map(|v| format!("{:.4}", v)).collect();
+                                println!(
+                                    "[{}] First non-zero chunk detected: max {:.4}, preview [{}]",
+                                    now.format("%H:%M:%S"),
+                                    chunk_max,
+                                    preview.join(" ")
+                                );
                             }
                         }
-                    },
-                    err_fn,
-                    None,
-                )
-            },
-            cpal::SampleFormat::I16 => {
-                let state_clone2 = state_clone.clone();
-                let callback_count_clone = callback_count.clone();
-                let zero_chunk_count_clone = zero_chunk_count.clone();
-                let logged_non_zero_clone = logged_non_zero.clone();
-                device.build_input_stream(
-                    &config.into(),
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        let mut state = state_clone2.lock();
-                        if state.is_recording {
-                            for &sample in data.iter().step_by(channels) {
-                                state.audio_buffer.push(sample as f32 / 32768.0);
-                            }
-                            let mut count = callback_count_clone.lock();
-                            *count += 1;
-                            if *count % 100 == 0 {
-                                let now = chrono::Local::now();
-                                println!("[{}] Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
-                                         now.format("%H:%M:%S"), *count, data.len(),
-                                         state.audio_buffer.len(), state.audio_buffer.len() as f32 / device_sample_rate as f32);
-                            }
+                        let mut count = callback_count.lock();
+                        *count += 1;
+                        if *count % 100 == 0 {
+                            let now = chrono::Local::now();
+                            println!("[{}] Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
+                                     now.format("%H:%M:%S"), *count, data.len(),
+                                     state.audio_buffer.len(), state.audio_buffer.len() as f32 / device_sample_rate as f32);
                         }
-                    },
-                    err_fn,
-                    None,
-                )
-            },
-            _ => {
-                eprintln!("Unsupported sample format");
-                return;
-            }
-        };
+                    }
+                },
+                |err| eprintln!("Error in audio stream: {}", err),
+                None,
+            )
+        },
+        cpal::SampleFormat::I16 => {
+            let state_clone = state.clone();
+            let callback_count = Arc::new(ParkingMutex::new(0u64));
 
-        match stream {
-            Ok(stream) => {
-                if let Err(e) = stream.play() {
-                    eprintln!("Failed to start stream: {}", e);
-                    return;
-                }
-
-                let now = chrono::Local::now();
-                println!("[{}] Recording started successfully", now.format("%H:%M:%S"));
-
-                // Keep stream alive while recording
-                while state_clone_for_thread.lock().is_recording {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-
-                drop(stream);
-                let now = chrono::Local::now();
-                println!("[{}] Stream stopped", now.format("%H:%M:%S"));
-            }
-            Err(e) => {
-                eprintln!("Failed to build stream: {}", e);
-            }
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let mut state = state_clone.lock();
+                    if state.is_recording && state.recording_id == current_recording_id {
+                        for &sample in data.iter().step_by(channels) {
+                            state.audio_buffer.push(sample as f32 / 32768.0);
+                        }
+                        let mut count = callback_count.lock();
+                        *count += 1;
+                        if *count % 100 == 0 {
+                            let now = chrono::Local::now();
+                            println!("[{}] Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
+                                     now.format("%H:%M:%S"), *count, data.len(),
+                                     state.audio_buffer.len(), state.audio_buffer.len() as f32 / device_sample_rate as f32);
+                        }
+                    }
+                },
+                |err| eprintln!("Error in audio stream: {}", err),
+                None,
+            )
+        },
+        _ => {
+            return Err("Unsupported sample format".to_string());
         }
-    });
+    }.map_err(|e| format!("Failed to build stream: {}", e))?;
+
+    stream.play().map_err(|e| format!("Failed to start stream: {}", e))?;
+
+    {
+        let mut state_guard = state.lock();
+        state_guard.is_recording = true;
+        state_guard.audio_buffer.clear();
+        state_guard.sample_rate = device_sample_rate;
+    }
+
+    // Leak the stream to keep it alive - it will be invalidated by recording_id on next recording
+    // This prevents Send trait issues while ensuring old callbacks can't write to new recordings
+    std::mem::forget(stream);
+
+    let now = chrono::Local::now();
+    println!("[{}] Recording started successfully", now.format("%H:%M:%S"));
 
     Ok(())
 }
@@ -370,12 +364,13 @@ async fn stop_recording(_app_handle: AppHandle) -> Result<Vec<f32>, String> {
 
     state_guard.is_recording = false;
     let device_sample_rate = state_guard.sample_rate;
-    drop(state_guard);
 
-    // Wait a bit for the last audio samples to be captured
+    let now = chrono::Local::now();
+    println!("[{}] Stopping recording, waiting for stream...", now.format("%H:%M:%S"));
+
+    // Wait for stream thread to finish and drop the stream
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let mut state_guard = state.lock();
     let audio_data = std::mem::take(&mut state_guard.audio_buffer);
     drop(state_guard);
     let sample_count = audio_data.len();
@@ -473,6 +468,7 @@ async fn select_audio_device(device_name: String) -> Result<(), String> {
             audio_buffer: Vec::new(),
             sample_rate: 16000,
             selected_device_name: None,
+            recording_id: 0,
         }))
     });
 
@@ -522,20 +518,44 @@ async fn get_supported_languages() -> Result<Vec<(String, String)>, String> {
     ])
 }
 
-// Simple linear resampling
+// Linear resampling with simple low-pass pre-filter to avoid aliasing
 fn resample_audio(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate {
         return input.to_vec();
     }
 
+    // Simple moving-average low-pass filter when downsampling
+    let filtered: Vec<f32> = if from_rate > to_rate {
+        let window = (from_rate / to_rate).max(2) as usize;
+        let mut acc = 0.0f32;
+        let mut filtered = Vec::with_capacity(input.len());
+        for (i, &sample) in input.iter().enumerate() {
+            acc += sample;
+            if i >= window {
+                acc -= input[i - window];
+            }
+            filtered.push(acc / window as f32);
+        }
+        filtered
+    } else {
+        input.to_vec()
+    };
+
     let ratio = from_rate as f64 / to_rate as f64;
-    let output_len = (input.len() as f64 / ratio) as usize;
+    let output_len = ((filtered.len() as f64) / ratio).ceil() as usize;
     let mut output = Vec::with_capacity(output_len);
 
     for i in 0..output_len {
-        let src_idx = (i as f64 * ratio) as usize;
-        if src_idx < input.len() {
-            output.push(input[src_idx]);
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = src_pos - idx as f64;
+
+        if idx + 1 < filtered.len() {
+            let sample = filtered[idx] as f64 * (1.0 - frac)
+                + filtered[idx + 1] as f64 * frac;
+            output.push(sample as f32);
+        } else if idx < filtered.len() {
+            output.push(filtered[idx]);
         }
     }
 

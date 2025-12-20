@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Mic, MicOff, Play, Square } from "lucide-react";
+import { Mic, MicOff, Play, Square, Settings } from "lucide-react";
 import "./App.css";
 
 interface TranscriptionSegment {
@@ -45,6 +45,7 @@ function App() {
   const [hasMicPermission, setHasMicPermission] = useState<boolean | null>(
     null
   );
+  const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     const unlisten = listen<TranscriptionSegment>(
@@ -183,7 +184,7 @@ function App() {
       const audioData = await invoke<number[]>("stop_recording");
 
       if (audioData.length > 0) {
-        const result = await invoke<{
+        await invoke<{
           success: boolean;
           text?: string;
           error?: string;
@@ -191,15 +192,7 @@ function App() {
           audioData: audioData,
           language: selectedLanguage === "auto" ? null : selectedLanguage,
         });
-
-        if (result.success && result.text) {
-          const segment: TranscriptionSegment = {
-            text: result.text,
-            timestamp: Date.now(),
-            audioData: audioData,
-          };
-          setTranscriptions((prev) => [...prev, segment]);
-        }
+        // Backend will emit "transcription-segment" event, no need to add manually
       }
     } catch (err) {
       console.error("Recording stop error:", err);
@@ -269,98 +262,31 @@ function App() {
   };
 
   return (
-    <div className="flex flex-col h-screen w-screen">
+    <div className="flex flex-col h-screen w-screen bg-base-100">
       {/* Header */}
-      <header className="bg-[#1a1a2e] border-b border-slate-700 px-8 py-4 flex-shrink-0">
-        <div className="max-w-6xl mx-auto flex justify-between items-center gap-8">
-          <h1 className="text-2xl font-bold bg-linear-to-r from-primary to-secondary bg-clip-text text-transparent whitespace-nowrap">
-            🎙️ Local Whisper
-          </h1>
-
-          <div className="flex items-center gap-6 flex-wrap">
-            <div className="flex flex-col gap-1">
-              <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                モデル
-              </label>
-              <select
-                value={selectedModel}
-                onChange={(e) => setSelectedModel(e.target.value)}
-                className="px-3 py-2 bg-[#0f0f23] border border-slate-700 rounded-md text-slate-200 text-sm cursor-pointer transition-all hover:border-primary focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 min-w-[150px]"
-              >
-                {availableModels.map((model) => (
-                  <option key={model.path} value={model.path}>
-                    {model.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="flex flex-col gap-1">
-              <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                言語
-              </label>
-              <select
-                value={selectedLanguage}
-                onChange={(e) => setSelectedLanguage(e.target.value)}
-                disabled={!isMuted || isTranscribing}
-                className="px-3 py-2 bg-[#0f0f23] border border-slate-700 rounded-md text-slate-200 text-sm cursor-pointer transition-all hover:border-primary focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 min-w-[150px] disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {availableLanguages.map(([code, name]) => (
-                  <option key={code} value={code}>
-                    {name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="flex flex-col gap-1">
-              <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                マイク
-              </label>
-              <select
-                value={selectedAudioDevice}
-                onChange={(e) => handleAudioDeviceChange(e.target.value)}
-                disabled={!isMuted || isTranscribing}
-                className="px-3 py-2 bg-[#0f0f23] border border-slate-700 rounded-md text-slate-200 text-sm cursor-pointer transition-all hover:border-primary focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 min-w-[200px] disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {audioDevices.map((device) => (
-                  <option key={device.name} value={device.name}>
-                    {device.name} {device.is_default ? "(デフォルト)" : ""}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {hasMicPermission === false && (
-              <div className="px-4 py-2 rounded-full text-xs font-semibold uppercase tracking-wider bg-red-500/10 text-red-500 border border-red-500">
-                ⚠️ マイク権限なし
-              </div>
-            )}
-            {hasMicPermission === true && !isInitialized && (
-              <div className="px-4 py-2 rounded-full text-xs font-semibold uppercase tracking-wider bg-amber-500/10 text-amber-500 border border-amber-500">
-                初期化中...
-              </div>
-            )}
-            {hasMicPermission === true && isInitialized && (
-              <div className="px-4 py-2 rounded-full text-xs font-semibold uppercase tracking-wider bg-emerald-500/10 text-emerald-500 border border-emerald-500">
-                準備完了
-              </div>
-            )}
-          </div>
+      <header className="navbar bg-base-200 border-b border-base-300 px-4">
+        <div className="flex-1">
+          <h1 className="text-xl font-bold">🎙️ Local Whisper</h1>
         </div>
+        <button
+          className="btn btn-ghost btn-circle"
+          onClick={() => setShowSettings(true)}
+        >
+          <Settings className="w-5 h-5" />
+        </button>
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 overflow-y-auto px-8 py-8 flex flex-col items-center">
-        {error && (
-          <div className="w-full max-w-3xl px-6 py-4 bg-red-500/10 border border-red-500 rounded-lg text-red-500 mb-6 text-sm">
-            ⚠️ {error}
-          </div>
-        )}
+      <main className="flex-1 overflow-y-auto p-4">
+        <div className="max-w-3xl mx-auto space-y-3">
+          {error && (
+            <div className="alert alert-error">
+              <span className="text-sm">{error}</span>
+            </div>
+          )}
 
-        <div className="w-full max-w-3xl flex-1 flex flex-col">
           {transcriptions.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center text-slate-400">
+            <div className="flex-1 flex flex-col items-center justify-center text-center text-base-content/50">
               <div className="text-6xl mb-4 opacity-50">🎤</div>
               <p className="text-lg mb-2">
                 マイクボタンをクリックして録音を開始
@@ -372,67 +298,152 @@ function App() {
           ) : (
             <div className="flex flex-col gap-6 pb-8">
               {transcriptions.map((segment, index) => (
-                <div
-                  key={index}
-                  className="bg-[#1a1a2e] rounded-2xl p-5 border border-slate-700 transition-all hover:border-primary hover:shadow-lg hover:shadow-primary/15 transcription-slide-in"
-                >
-                  <div className="flex justify-between items-center mb-3">
-                    <span className="text-xs text-slate-400 font-semibold">
-                      {new Date(segment.timestamp).toLocaleTimeString()}
-                    </span>
-                    {segment.audioData && (
-                      <button
-                        className="w-7 h-7 rounded-full bg-linear-to-br from-primary to-secondary flex items-center justify-center transition-all hover:scale-110 hover:shadow-lg hover:shadow-primary/40 active:scale-95"
-                        onClick={() => playAudio(segment.audioData!, index)}
-                        title={playingIndex === index ? "停止" : "音声を再生"}
-                      >
-                        {playingIndex === index ? (
-                          <Square className="w-3 h-3 text-white fill-white" />
-                        ) : (
-                          <Play className="w-3 h-3 text-white fill-white" />
-                        )}
-                      </button>
-                    )}
+                <div key={index} className="card bg-base-200 shadow-sm">
+                  <div className="card-body p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex-1">
+                        <p className="text-sm leading-relaxed">
+                          {segment.text}
+                        </p>
+                        <p className="text-xs opacity-60 mt-2">
+                          {new Date(segment.timestamp).toLocaleTimeString()}
+                        </p>
+                      </div>
+                      {segment.audioData && (
+                        <button
+                          onClick={() => playAudio(segment.audioData!, index)}
+                          className="btn btn-circle btn-sm btn-ghost"
+                        >
+                          {playingIndex === index ? (
+                            <Square className="w-4 h-4" />
+                          ) : (
+                            <Play className="w-4 h-4" />
+                          )}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <p className="text-base leading-relaxed text-slate-200">
-                    {segment.text}
-                  </p>
                 </div>
               ))}
             </div>
           )}
 
           {isTranscribing && (
-            <div className="flex items-center justify-center gap-3 p-4 text-slate-400 text-sm">
-              <div className="w-5 h-5 border-2 border-slate-700 border-t-primary rounded-full spinner"></div>
-              <span>文字起こし中...</span>
+            <div className="flex items-center justify-center gap-3 py-4">
+              <span className="loading loading-spinner loading-md"></span>
+              <span className="text-sm">文字起こし中...</span>
             </div>
           )}
         </div>
       </main>
 
       {/* Footer */}
-      <footer className="flex-shrink-0 px-8 py-8 flex justify-center items-center bg-[#1a1a2e] border-t border-slate-700">
-        <button
-          className={`relative w-16 h-16 rounded-full border-none cursor-pointer transition-all flex flex-col items-center justify-center gap-2 ${
-            !isInitialized || isTranscribing
-              ? "opacity-50 cursor-not-allowed bg-slate-700"
-              : isMuted
-              ? "bg-linear-to-br from-primary to-secondary shadow-lg shadow-primary/30 hover:scale-105 hover:shadow-xl hover:shadow-primary/40 active:scale-95"
-              : "bg-linear-to-br from-red-500 to-red-600 mic-button-pulse"
-          }`}
-          onClick={toggleMute}
-          disabled={!isInitialized || isTranscribing}
-        >
-          <div className="text-white flex items-center justify-center">
+      <footer className="bg-base-200 border-t border-base-300 h-20 flex items-center">
+        <div className="flex items-center justify-between w-full px-4">
+          <div className="flex-1"></div>
+          <button
+            className={`btn btn-circle btn-lg ${
+              !isInitialized || isTranscribing
+                ? "btn-disabled"
+                : isMuted
+                ? "btn-primary"
+                : "btn-error animate-pulse"
+            }`}
+            onClick={toggleMute}
+            disabled={!isInitialized || isTranscribing}
+          >
             {isMuted ? (
               <MicOff className="w-6 h-6" />
             ) : (
               <Mic className="w-6 h-6" />
             )}
+          </button>
+          <div className="flex-1 flex justify-end items-center">
+            <select
+              value={selectedLanguage}
+              onChange={(e) => setSelectedLanguage(e.target.value)}
+              className="select select-bordered select-sm w-32"
+            >
+              {availableLanguages.length === 0 ? (
+                <option value="ja">日本語</option>
+              ) : (
+                availableLanguages.map(([code, name]) => (
+                  <option key={code} value={code}>
+                    {name}
+                  </option>
+                ))
+              )}
+            </select>
           </div>
-        </button>
+        </div>
       </footer>
+
+      {/* Settings Modal */}
+      {showSettings && (
+        <dialog className="modal modal-open">
+          <div className="modal-box">
+            <h3 className="font-bold text-lg mb-4">設定</h3>
+
+            <div className="space-y-4">
+              <div className="form-control">
+                <label className="label">
+                  <span className="label-text">モデル</span>
+                </label>
+                <select
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="select select-bordered w-full"
+                >
+                  {availableModels.map((model) => (
+                    <option key={model.path} value={model.path}>
+                      {model.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="form-control">
+                <label className="label">
+                  <span className="label-text">マイク</span>
+                </label>
+                <select
+                  value={selectedAudioDevice}
+                  onChange={(e) => handleAudioDeviceChange(e.target.value)}
+                  className="select select-bordered w-full"
+                >
+                  {audioDevices.map((device) => (
+                    <option key={device.name} value={device.name}>
+                      {device.name}
+                      {device.is_default ? " (デフォルト)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {hasMicPermission === false && (
+                <div className="alert alert-warning">
+                  <span className="text-xs">⚠️ マイクの許可が必要です</span>
+                </div>
+              )}
+
+              {!isInitialized && selectedModel && (
+                <div className="alert alert-info">
+                  <span className="text-xs">初期化中...</span>
+                </div>
+              )}
+            </div>
+
+            <div className="modal-action">
+              <button className="btn" onClick={() => setShowSettings(false)}>
+                閉じる
+              </button>
+            </div>
+          </div>
+          <form method="dialog" className="modal-backdrop">
+            <button onClick={() => setShowSettings(false)}>close</button>
+          </form>
+        </dialog>
+      )}
     </div>
   );
 }
