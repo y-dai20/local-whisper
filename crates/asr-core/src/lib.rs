@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 use thiserror::Error;
 use whisper_rs::{WhisperContext as WhisperRsContext, WhisperContextParameters, FullParams, SamplingStrategy};
 
@@ -45,8 +46,15 @@ impl WhisperContext {
         params.set_n_threads(num_cpus());
         params.set_single_segment(false);
 
+        let inference_start = Instant::now();
         state.full(params, audio_data)
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+        let inference_elapsed = inference_start.elapsed();
+        println!(
+            "[Whisper] Inference (streaming) completed in {:.2?} for {} samples",
+            inference_elapsed,
+            audio_data.len()
+        );
 
         let num_segments = state.full_n_segments()
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
@@ -94,8 +102,15 @@ impl WhisperContext {
         params.set_n_threads(num_cpus());
         params.set_single_segment(false);
 
+        let inference_start = Instant::now();
         state.full(params, audio_data)
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+        let inference_elapsed = inference_start.elapsed();
+        println!(
+            "[Whisper] Inference (streaming) completed in {:.2?} for {} samples",
+            inference_elapsed,
+            audio_data.len()
+        );
 
         let num_segments = state.full_n_segments()
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;

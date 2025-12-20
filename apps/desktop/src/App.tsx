@@ -264,12 +264,10 @@ function App() {
   return (
     <div className="flex flex-col h-screen w-screen bg-base-100">
       {/* Header */}
-      <header className="navbar bg-base-200 border-b border-base-300 px-4">
-        <div className="flex-1">
-          <h1 className="text-xl font-bold">🎙️ Local Whisper</h1>
-        </div>
+      <header className="flex bg-base-200 border-b border-base-300 px-4 py-1">
+        <div className="flex-1"></div>
         <button
-          className="btn btn-ghost btn-circle"
+          className="btn btn-ghost btn-circle btn-sm"
           onClick={() => setShowSettings(true)}
         >
           <Settings className="w-5 h-5" />
