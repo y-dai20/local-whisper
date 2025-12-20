@@ -19,11 +19,14 @@ pub struct WhisperContext {
 
 impl WhisperContext {
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self, WhisperError> {
+        let mut ctx_params = WhisperContextParameters::default();
+        ctx_params.use_gpu(true).flash_attn(true);
+
         let ctx = WhisperRsContext::new_with_params(
             model_path.as_ref().to_str().ok_or(WhisperError::InvalidModelPath)?,
-            WhisperContextParameters::default(),
+            ctx_params,
         )
-        .map_err(|e| WhisperError::InitializationFailed(e.to_string()))?;
+            .map_err(|e| WhisperError::InitializationFailed(e.to_string()))?;
 
         Ok(Self { ctx })
     }

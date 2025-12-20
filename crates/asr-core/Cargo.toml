@@ -2,7 +2,9 @@
 name = "asr-core"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
-whisper-rs = { version = "0.12", features = ["whisper-cpp-log"] }
+whisper-rs = { version = "0.12", features = ["whisper-cpp-log", "metal"] }
 thiserror = "1.0"
+hound = "3.5"
