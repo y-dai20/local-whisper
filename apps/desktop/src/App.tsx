@@ -16,6 +16,16 @@ interface ModelInfo {
   size: number;
 }
 
+interface RemoteModelStatus {
+  id: string;
+  name: string;
+  filename: string;
+  size: number;
+  description: string;
+  installed: boolean;
+  path?: string;
+}
+
 interface AudioDevice {
   name: string;
   is_default: boolean;
@@ -46,6 +56,11 @@ function App() {
     null
   );
   const [showSettings, setShowSettings] = useState(false);
+  const [remoteModels, setRemoteModels] = useState<RemoteModelStatus[]>([]);
+  const [modelOperations, setModelOperations] = useState<
+    Record<string, boolean>
+  >({});
+  const [isLoadingRemoteModels, setIsLoadingRemoteModels] = useState(false);
 
   useEffect(() => {
     const unlisten = listen<TranscriptionSegment>(
@@ -59,6 +74,7 @@ function App() {
     loadLanguages();
     checkMicPermission();
     loadAudioDevices();
+    loadRemoteModels();
 
     return () => {
       unlisten.then((fn) => fn());
@@ -76,9 +92,12 @@ function App() {
     try {
       const models = await invoke<ModelInfo[]>("scan_models");
       setAvailableModels(models);
-      if (models.length > 0) {
-        setSelectedModel(models[0].path);
-      }
+      setSelectedModel((prev) => {
+        if (prev && models.some((model) => model.path === prev)) {
+          return prev;
+        }
+        return models[0]?.path ?? "";
+      });
     } catch (err) {
       console.error("Model scan error:", err);
       setError(`モデルスキャンエラー: ${err}`);
@@ -91,6 +110,19 @@ function App() {
       setAvailableLanguages(langs);
     } catch (err) {
       console.error("Failed to load languages:", err);
+    }
+  };
+
+  const loadRemoteModels = async () => {
+    try {
+      setIsLoadingRemoteModels(true);
+      const models = await invoke<RemoteModelStatus[]>("list_remote_models");
+      setRemoteModels(models);
+    } catch (err) {
+      console.error("Failed to load remote models:", err);
+      setError(`リモートモデル取得エラー: ${err}`);
+    } finally {
+      setIsLoadingRemoteModels(false);
     }
   };
 
@@ -133,6 +165,49 @@ function App() {
       console.error("Failed to select audio device:", err);
       setError(`デバイス選択エラー: ${err}`);
     }
+  };
+
+  const refreshAllModels = async () => {
+    await scanForModels();
+    await loadRemoteModels();
+  };
+
+  const handleInstallModel = async (modelId: string) => {
+    setModelOperations((prev) => ({ ...prev, [modelId]: true }));
+    try {
+      await invoke<ModelInfo>("install_model", { modelId });
+      await refreshAllModels();
+    } catch (err) {
+      console.error("Install model error:", err);
+      setError(
+        `モデルインストールエラー: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    } finally {
+      setModelOperations((prev) => ({ ...prev, [modelId]: false }));
+    }
+  };
+
+  const handleDeleteModel = async (model: RemoteModelStatus) => {
+    if (!model.path) return;
+    setModelOperations((prev) => ({ ...prev, [model.id]: true }));
+    try {
+      await invoke("delete_model", { modelPath: model.path });
+      setSelectedModel((prev) => (prev === model.path ? "" : prev));
+      await refreshAllModels();
+    } catch (err) {
+      console.error("Delete model error:", err);
+      setError(
+        `モデル削除エラー: ${err instanceof Error ? err.message : String(err)}`
+      );
+    } finally {
+      setModelOperations((prev) => ({ ...prev, [model.id]: false }));
+    }
+  };
+
+  const formatModelSize = (bytes: number) => {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
   const initializeWhisper = async () => {
@@ -398,6 +473,98 @@ function App() {
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="label-text font-semibold">
+                    利用可能なモデル
+                  </span>
+                  <button
+                    className="btn btn-xs"
+                    onClick={refreshAllModels}
+                    disabled={isLoadingRemoteModels}
+                  >
+                    更新
+                  </button>
+                </div>
+
+                <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
+                  {isLoadingRemoteModels ? (
+                    <div className="flex items-center gap-2 text-sm">
+                      <span className="loading loading-spinner loading-xs"></span>
+                      読み込み中...
+                    </div>
+                  ) : remoteModels.length === 0 ? (
+                    <p className="text-sm opacity-60">
+                      利用可能なモデルが見つかりません
+                    </p>
+                  ) : (
+                    remoteModels.map((model) => (
+                      <div
+                        key={model.id}
+                        className="border border-base-300 rounded-xl p-3 flex flex-col gap-2"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="font-medium text-sm">{model.name}</p>
+                            <p className="text-xs opacity-70">
+                              {model.description}
+                            </p>
+                            <p className="text-xs opacity-60 mt-1">
+                              {formatModelSize(model.size)}
+                            </p>
+                            {model.installed && model.path && (
+                              <p className="text-[11px] opacity-50 mt-1 break-all">
+                                {model.path}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex flex-col gap-2 items-end">
+                            {model.installed ? (
+                              <>
+                                <button
+                                  className="btn btn-xs btn-outline"
+                                  disabled={
+                                    selectedModel === model.path ||
+                                    !model.path ||
+                                    modelOperations[model.id]
+                                  }
+                                  onClick={() =>
+                                    model.path && setSelectedModel(model.path)
+                                  }
+                                >
+                                  {selectedModel === model.path
+                                    ? "使用中"
+                                    : "このモデルを使用"}
+                                </button>
+                                <button
+                                  className="btn btn-xs btn-error"
+                                  onClick={() => handleDeleteModel(model)}
+                                  disabled={modelOperations[model.id]}
+                                >
+                                  {modelOperations[model.id]
+                                    ? "削除中..."
+                                    : "削除"}
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                className="btn btn-xs btn-primary"
+                                onClick={() => handleInstallModel(model.id)}
+                                disabled={modelOperations[model.id]}
+                              >
+                                {modelOperations[model.id]
+                                  ? "インストール中..."
+                                  : "インストール"}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
 
               <div className="form-control">

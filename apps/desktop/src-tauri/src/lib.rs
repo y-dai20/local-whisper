@@ -1,12 +1,50 @@
-use asr_core::{WhisperContext};
-use once_cell::sync::OnceCell;
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use std::path::PathBuf;
-use tauri::{AppHandle, Emitter};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use parking_lot::Mutex as ParkingMutex;
+use asr_core::WhisperContext;
 use chrono;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use once_cell::sync::OnceCell;
+use parking_lot::Mutex as ParkingMutex;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+
+const REMOTE_MODELS: &[RemoteModel] = &[
+    RemoteModel {
+        id: "base",
+        name: "Whisper Base",
+        filename: "ggml-base.bin",
+        size: 74438528,
+        description: "英語・多言語兼用 / 約 74 MB",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+    },
+    RemoteModel {
+        id: "small",
+        name: "Whisper Small",
+        filename: "ggml-small.bin",
+        size: 244452544,
+        description: "中規模モデル / 約 244 MB",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+    },
+    RemoteModel {
+        id: "medium",
+        name: "Whisper Medium",
+        filename: "ggml-medium.bin",
+        size: 769073152,
+        description: "高精度モデル / 約 769 MB",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+    },
+    RemoteModel {
+        id: "large-v3-turbo",
+        name: "Whisper Large v3 Turbo",
+        filename: "ggml-large-v3-turbo.bin",
+        size: 3085627392,
+        description: "最新 Large モデル / 約 3.1 GB",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+    },
+];
 
 static WHISPER_CTX: OnceCell<Arc<Mutex<Option<WhisperContext>>>> = OnceCell::new();
 static RECORDING_STATE: OnceCell<Arc<ParkingMutex<RecordingState>>> = OnceCell::new();
@@ -42,22 +80,43 @@ struct ModelInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct RemoteModelStatus {
+    id: String,
+    name: String,
+    filename: String,
+    size: u64,
+    description: String,
+    installed: bool,
+    path: Option<String>,
+}
+
+struct RemoteModel {
+    id: &'static str,
+    name: &'static str,
+    filename: &'static str,
+    size: u64,
+    description: &'static str,
+    url: &'static str,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct AudioDevice {
     name: String,
     is_default: bool,
 }
 
-#[tauri::command]
-async fn scan_models() -> Result<Vec<ModelInfo>, String> {
-    let mut models = Vec::new();
-
-    // プロジェクトルートからの相対パス
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn model_directory() -> Result<PathBuf, String> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
         .map(|p| p.join("vendor/whisper.cpp/models"))
-        .ok_or("Failed to resolve model directory")?;
+        .ok_or_else(|| "Failed to resolve model directory".to_string())
+}
+
+fn read_installed_models() -> Result<Vec<ModelInfo>, String> {
+    let mut models = Vec::new();
+    let model_dir = model_directory()?;
 
     if !model_dir.exists() {
         return Ok(models);
@@ -86,6 +145,11 @@ async fn scan_models() -> Result<Vec<ModelInfo>, String> {
 
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(models)
+}
+
+#[tauri::command]
+async fn scan_models() -> Result<Vec<ModelInfo>, String> {
+    read_installed_models()
 }
 
 #[tauri::command]
@@ -142,6 +206,119 @@ async fn transcribe_audio(
             error: Some(e.to_string()),
         }),
     }
+}
+
+#[tauri::command]
+async fn list_remote_models() -> Result<Vec<RemoteModelStatus>, String> {
+    let installed = read_installed_models()?;
+    let mut statuses = Vec::new();
+
+    for remote in REMOTE_MODELS {
+        let installed_entry = installed
+            .iter()
+            .find(|m| Path::new(&m.path).file_name().map(|n| n == remote.filename).unwrap_or(false));
+
+        statuses.push(RemoteModelStatus {
+            id: remote.id.to_string(),
+            name: remote.name.to_string(),
+            filename: remote.filename.to_string(),
+            size: remote.size,
+            description: remote.description.to_string(),
+            installed: installed_entry.is_some(),
+            path: installed_entry.map(|m| m.path.clone()),
+        });
+    }
+
+    Ok(statuses)
+}
+
+#[tauri::command]
+async fn install_model(model_id: String) -> Result<ModelInfo, String> {
+    let model = REMOTE_MODELS
+        .iter()
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| "Unknown model id".to_string())?;
+
+    let dir = model_directory()?;
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create model dir: {}", e))?;
+    }
+
+    let target_path = dir.join(model.filename);
+    if target_path.exists() {
+        let metadata = std::fs::metadata(&target_path)
+            .map_err(|e| format!("Failed to read existing model metadata: {}", e))?;
+        return Ok(ModelInfo {
+            name: model.filename.to_string(),
+            path: target_path.to_string_lossy().to_string(),
+            size: metadata.len(),
+        });
+    }
+
+    let tmp_path = target_path.with_extension("download");
+    let client = Client::new();
+    let mut response = client
+        .get(model.url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download model: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Download failed with status {}", response.status()));
+    }
+
+    let mut file = fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("Failed to read download chunk: {}", e))?
+    {
+        file.write_all(chunk.as_ref())
+            .await
+            .map_err(|e| format!("Failed to write chunk: {}", e))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("Failed to flush download: {}", e))?;
+
+    fs::rename(&tmp_path, &target_path)
+        .await
+        .map_err(|e| format!("Failed to move downloaded model: {}", e))?;
+
+    let metadata = std::fs::metadata(&target_path)
+        .map_err(|e| format!("Failed to read model metadata: {}", e))?;
+
+    Ok(ModelInfo {
+        name: model.filename.to_string(),
+        path: target_path.to_string_lossy().to_string(),
+        size: metadata.len(),
+    })
+}
+
+#[tauri::command]
+async fn delete_model(model_path: String) -> Result<(), String> {
+    let dir = model_directory()?;
+    let canonical_dir =
+        std::fs::canonicalize(&dir).map_err(|e| format!("Failed to resolve model dir: {}", e))?;
+
+    let target_path = PathBuf::from(&model_path);
+    if !target_path.exists() {
+        return Ok(());
+    }
+
+    let canonical_target = std::fs::canonicalize(&target_path)
+        .map_err(|e| format!("Failed to resolve target path: {}", e))?;
+
+    if !canonical_target.starts_with(&canonical_dir) {
+        return Err("Invalid model path".to_string());
+    }
+
+    fs::remove_file(canonical_target)
+        .await
+        .map_err(|e| format!("Failed to delete model: {}", e))
 }
 
 #[tauri::command]
@@ -576,7 +753,10 @@ pub fn run() {
             get_supported_languages,
             list_audio_devices,
             select_audio_device,
-            check_microphone_permission
+            check_microphone_permission,
+            list_remote_models,
+            install_model,
+            delete_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
