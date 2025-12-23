@@ -13,7 +13,7 @@
     "windows": [
       {
         "title": "local-whisper",
-        "width": 800,
+        "width": 600,
         "height": 600
       }
     ],

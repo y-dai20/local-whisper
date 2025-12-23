@@ -1,172 +1,78 @@
 # Local Whisper
 
-CPU 環境で高速に動作する、完全オフラインの文字起こしアプリ
+Apple Silicon (M1/M2/M3) 向けに最適化した、完全ローカル動作の高精度・低遅延文字起こしアプリです。
+Web 会議や YouTube などのシステム音声も、マイク入力も、そのままテキスト化できます。
 
-## 特徴
+## なにができる？
 
-- ✅ **完全オフライン**: ネットワークアクセス不要
-- ⚡ **CPU 最適化**: whisper.cpp を使用した高速処理
-- 🎙️ **リアルタイム録音**: マイク入力から直接文字起こし
-- 🇯🇵 **日本語対応**: 日本語音声の文字起こしに最適化
-- 🖥️ **クロスプラットフォーム**: Tauri ベースのデスクトップアプリ
+- 🔒 **完全ローカル** – ネットワークアクセス不要。機密音声も安心。
+- ⚡ **低遅延** – whisper.cpp ベースの最適化で、Apple Silicon の CPU/GPU を無駄なく活用。
+- 🎧 **音声ソースを選べる** – マイク入力とシステム音声入力をワンタップで切り替え。
+- 🎥 **録画もできる** – Web 会議や配信をキャプチャして、そのまま文字起こしに活用。
+- 🗣️ **日本語に強い** – 長時間の会議記録や動画も安定して文字起こし。
+- 🪄 **モデルを UI から選択** – base / small / medium / large v3 turbo を切り替えて精度と速度を調整。
 
-## アーキテクチャ
+## 必要環境
 
-```
-local-whisper/
-├── vendor/whisper.cpp/          # whisper.cpp submodule (モデルファイル用)
-├── crates/asr-core/              # whisper-rsのラッパー
-└── apps/desktop/                 # Tauri + React frontend
-    ├── src/                      # React UI
-    └── src-tauri/                # Rust backend
-```
+- Apple Silicon 搭載 Mac（macOS 13 以上推奨）
+- Rust 1.70+
+- Node.js 18+
+- pnpm
+- C++ コンパイラ（whisper.cpp のビルド用）
 
 ## セットアップ
 
-### 1. 必要な環境
+1. **リポジトリを取得**
 
-- Rust (1.70+)
-- Node.js (18+)
-- pnpm
-- C++ compiler (whisper.cpp のビルドに必要)
+   ```bash
+   git clone <repository-url>
+   cd local-whisper
+   git submodule update --init --recursive
+   ```
 
-### 2. リポジトリのクローン
+2. **依存関係をインストール**
 
-```bash
-git clone <repository-url>
-cd local-whisper
-git submodule update --init --recursive
-```
+   ```bash
+   cd apps/desktop
+   pnpm install
+   ```
 
-### 3. Whisper モデルのダウンロード
+3. **開発モードで起動**
+   ```bash
+   pnpm tauri dev
+   ```
+   ビルド済みバイナリが欲しい場合は `pnpm tauri build` を利用してください。
 
-```bash
-cd vendor/whisper.cpp/models
-bash download-ggml-model.sh base
-# または他のモデル: tiny, small, medium, large
-```
+## モデル選択のヒント
 
-利用可能なモデル:
+| モデル         | 特徴                   | 想定用途                          |
+| -------------- | ---------------------- | --------------------------------- |
+| base           | バランス型。初期設定。 | 日常的な会議や動画視聴            |
+| small          | base より高精度        | 長時間の会議メモ                  |
+| medium         | さらに高精度           | 医療/法律など誤差を減らしたい場面 |
+| large v3 turbo | 最高精度ながら高速     | 字幕生成やアーカイブ用途          |
 
-- `tiny`: 最速、精度低
-- `base`: バランス型（推奨）
-- `small`: 高精度
-- `medium`: より高精度
-- `large`: 最高精度、最も遅い
-
-### 4. 依存関係のインストール
-
-```bash
-cd apps/desktop
-pnpm install
-```
-
-### 5. アプリの起動
-
-```bash
-cd apps/desktop
-pnpm tauri dev
-```
+モデルはアプリ内のプルダウンから即時切り替えできます。
+精度重視なら `medium / large v3 turbo`、レスポンス優先なら `base` を選ぶのがおすすめです。
 
 ## 使い方
 
-1. アプリを起動
-2. ダウンロードしたモデルのパスを入力（例: `/path/to/local-whisper/vendor/whisper.cpp/models/ggml-base.bin`）
-3. 「初期化」ボタンをクリック
-4. 「録音開始」ボタンでマイク録音を開始
-5. 「録音停止」ボタンで録音を停止し、文字起こしを実行
-6. 結果がリアルタイムで表示されます
-
-## 技術スタック
-
-### Backend
-
-- **Rust**: システムプログラミング言語
-- **Tauri**: デスクトップアプリフレームワーク
-- **whisper.cpp**: CPU 最適化された Whisper 実装
-- **bindgen**: C/C++ FFI bindings 生成
-
-### Frontend
-
-- **React**: UI フレームワーク
-- **TypeScript**: 型安全な JavaScript
-- **Vite**: 高速ビルドツール
-- **Web Audio API**: マイク入力処理
-
-## 開発
-
-### プロジェクト構造
-
-- `crates/asr-core`: whisper-rs の Safe Rust ラッパー
-
-  - `WhisperContext`: モデルの初期化と管理
-  - `transcribe()`: 音声データの文字起こし
-  - `transcribe_with_callback()`: ストリーミング文字起こし
-  - whisper-rs crate を使用して簡潔に実装
-
-- `apps/desktop/src-tauri`: Tauri バックエンド
-  - `initialize_whisper`: モデルの初期化
-  - `transcribe_audio`: 音声データの文字起こし
-  - `transcribe_audio_stream`: ストリーミング文字起こし
-  - asr-core を呼び出して UI にイベントを emit
-
-### ビルド
-
-```bash
-cd apps/desktop
-pnpm tauri build
-```
-
-## パフォーマンス最適化
-
-whisper.cpp は以下の CPU 最適化を使用:
-
-- AVX/AVX2 命令セット
-- FMA (Fused Multiply-Add)
-- F16C (Half-precision floating-point)
-- マルチスレッド処理
+1. `pnpm tauri dev` でアプリを起動。
+2. 入力ソースを **マイク** か **システム音声** から選択。
+3. [開始] でリアルタイム文字起こしを開始。必要に応じて [停止]。
+4. テキストはその場でコピーしたり、ログとして保存できます。
 
 ## トラブルシューティング
 
-### ビルドエラー
-
-**問題**: `bindgen`のエラー
-
-```bash
-# Clang/LLVMをインストール
-# macOS
-brew install llvm
-
-# Ubuntu/Debian
-sudo apt-get install libclang-dev
-```
-
-**問題**: whisper.cpp のコンパイルエラー
-
-```bash
-# C++コンパイラを確認
-g++ --version
-clang++ --version
-```
-
-### 実行時エラー
-
-**問題**: モデルの読み込みエラー
-
-- モデルファイルのパスが正しいか確認
-- モデルファイルが完全にダウンロードされているか確認
-
-**問題**: マイクアクセスエラー
-
-- システムのマイク権限を確認
-- 他のアプリがマイクを使用していないか確認
-
-## ライセンス
-
-このプロジェクトは MIT ライセンスの下で公開されています。
+- **音声が取得できない**: macOS の「システム設定 > プライバシーとセキュリティ > マイク」でアプリの権限を許可してください。
+- **パフォーマンスが出ない**: 一時的に別モデルへ切り替え、または他の重いアプリを終了して CPU/GPU 負荷を下げてください。
 
 ## 謝辞
 
-- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) - CPU 最適化された Whisper 実装
-- [OpenAI Whisper](https://github.com/openai/whisper) - 元の Whisper モデル
-- [Tauri](https://tauri.app/) - デスクトップアプリフレームワーク
+- [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+- [OpenAI Whisper](https://github.com/openai/whisper)
+- [Tauri](https://tauri.app/)
+
+## ライセンス
+
+本プロジェクトは [MIT License](./LICENSE) で提供されています。

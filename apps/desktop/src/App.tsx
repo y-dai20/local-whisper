@@ -1,13 +1,28 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Mic, MicOff, Play, Square, Settings } from "lucide-react";
+import {
+  Mic,
+  MicOff,
+  Play,
+  Square,
+  Settings,
+  Circle,
+  StopCircle,
+  Copy,
+  Moon,
+  Sun,
+  MessageSquare,
+} from "lucide-react";
 import "./App.css";
 
 interface TranscriptionSegment {
   text: string;
   timestamp: number;
   audioData?: number[];
+  sessionId: string;
+  isFinal: boolean;
+  source: string;
 }
 
 interface ModelInfo {
@@ -29,6 +44,17 @@ interface RemoteModelStatus {
 interface AudioDevice {
   name: string;
   is_default: boolean;
+}
+
+interface StreamingConfig {
+  vadThreshold: number;
+  partialIntervalSeconds: number;
+}
+
+interface VoiceActivityEvent {
+  source: string;
+  isActive: boolean;
+  timestamp: number;
 }
 
 function App() {
@@ -61,25 +87,287 @@ function App() {
     Record<string, boolean>
   >({});
   const [isLoadingRemoteModels, setIsLoadingRemoteModels] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  const [streamingConfig, setStreamingConfig] = useState<StreamingConfig>({
+    vadThreshold: 0.1,
+    partialIntervalSeconds: 4,
+  });
+  const [isSavingStreamingConfig, setIsSavingStreamingConfig] = useState(false);
+  const [recordingSaveEnabled, setRecordingSaveEnabled] = useState(false);
+  const [recordingSavePath, setRecordingSavePath] = useState("");
+  const [screenRecordingEnabled, setScreenRecordingEnabled] = useState(false);
+  const [isRecordingActive, setIsRecordingActive] = useState(false);
+  const [isRecordingBusy, setIsRecordingBusy] = useState(false);
+  const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
+  const [voiceActivity, setVoiceActivity] = useState<{
+    user: boolean;
+    system: boolean;
+  }>({ user: false, system: false });
 
   useEffect(() => {
-    const unlisten = listen<TranscriptionSegment>(
+    localStorage.setItem("theme", theme);
+    document.documentElement.setAttribute("data-theme", theme);
+  }, [theme]);
+
+  const loadStreamingConfig = useCallback(async () => {
+    try {
+      const config = await invoke<StreamingConfig>("get_streaming_config");
+      setStreamingConfig(config);
+    } catch (err) {
+      console.error("Failed to load streaming config:", err);
+    }
+  }, []);
+
+  const saveStreamingConfig = useCallback(
+    async (config: StreamingConfig) => {
+      setIsSavingStreamingConfig(true);
+      try {
+        await invoke("set_streaming_config", {
+          config,
+        });
+        setStreamingConfig(config);
+        localStorage.setItem("vadThreshold", config.vadThreshold.toString());
+        localStorage.setItem(
+          "partialIntervalSeconds",
+          config.partialIntervalSeconds.toString()
+        );
+      } catch (err) {
+        console.error("Failed to save streaming config:", err);
+        setError(
+          `ストリーミング設定エラー: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      } finally {
+        setIsSavingStreamingConfig(false);
+      }
+    },
+    [setError]
+  );
+
+  const toggleRecording = async () => {
+    if (isRecordingBusy) return;
+
+    if (!isRecordingActive) {
+      if (!recordingSaveEnabled || !recordingSavePath) {
+        setError("録画保存を有効にして保存先フォルダを設定してください");
+        return;
+      }
+      if (!screenRecordingEnabled && !isInitialized) {
+        setError("録画を開始する前にモデルを初期化してください");
+        return;
+      }
+
+      // 既存の文字起こし履歴をクリアして新しい録画用にリセット
+      setTranscriptions([]);
+      setPlayingIndex(null);
+      if (currentAudioSource) {
+        currentAudioSource.stop();
+        currentAudioSource.disconnect();
+        setCurrentAudioSource(null);
+      }
+      if (currentAudioContext) {
+        currentAudioContext.close();
+        setCurrentAudioContext(null);
+      }
+
+      setIsRecordingBusy(true);
+      try {
+        if (screenRecordingEnabled) {
+          await invoke("start_screen_recording");
+        }
+        await invoke("start_recording", {
+          language: selectedLanguage === "auto" ? null : selectedLanguage,
+        });
+        await invoke("start_system_audio");
+        setIsRecordingActive(true);
+        setError("");
+      } catch (err) {
+        console.error("Failed to start recording session:", err);
+        setError(
+          `録画開始エラー: ${err instanceof Error ? err.message : String(err)}`
+        );
+      } finally {
+        setIsRecordingBusy(false);
+      }
+      return;
+    }
+
+    setIsRecordingBusy(true);
+    try {
+      if (screenRecordingEnabled) {
+        await invoke("stop_screen_recording");
+      }
+      await invoke("stop_recording");
+      await invoke("stop_system_audio");
+      setIsRecordingActive(false);
+      setError("");
+    } catch (err) {
+      console.error("Failed to stop recording session:", err);
+      setError(
+        `録画停止エラー: ${err instanceof Error ? err.message : String(err)}`
+      );
+    } finally {
+      setIsRecordingBusy(false);
+    }
+  };
+
+  const loadRecordingSaveConfig = async () => {
+    try {
+      const [enabled, path] = await invoke<[boolean, string | null]>(
+        "get_recording_save_config"
+      );
+      setRecordingSaveEnabled(enabled);
+      setRecordingSavePath(path || "");
+    } catch (err) {
+      console.error("Failed to load recording save config:", err);
+    }
+  };
+
+  const saveRecordingSaveConfig = async (enabled: boolean, path: string) => {
+    try {
+      await invoke("set_recording_save_config", {
+        enabled,
+        path: path || null,
+      });
+      setRecordingSaveEnabled(enabled);
+      setRecordingSavePath(path);
+      localStorage.setItem("recordingSaveEnabled", enabled.toString());
+      localStorage.setItem("recordingSavePath", path);
+    } catch (err) {
+      console.error("Failed to save recording save config:", err);
+      setError(
+        `録画保存設定エラー: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  };
+
+  const loadSettingsFromLocalStorage = () => {
+    try {
+      const savedLanguage = localStorage.getItem("selectedLanguage");
+      if (savedLanguage) {
+        setSelectedLanguage(savedLanguage);
+      }
+
+      const savedVadThreshold = localStorage.getItem("vadThreshold");
+      const savedPartialInterval = localStorage.getItem(
+        "partialIntervalSeconds"
+      );
+      if (savedVadThreshold || savedPartialInterval) {
+        setStreamingConfig((prev) => ({
+          vadThreshold: savedVadThreshold
+            ? parseFloat(savedVadThreshold)
+            : prev.vadThreshold,
+          partialIntervalSeconds: savedPartialInterval
+            ? parseFloat(savedPartialInterval)
+            : prev.partialIntervalSeconds,
+        }));
+      }
+
+      const savedRecordingSaveEnabled = localStorage.getItem(
+        "recordingSaveEnabled"
+      );
+      const savedRecordingSavePath = localStorage.getItem("recordingSavePath");
+      if (savedRecordingSaveEnabled !== null) {
+        const enabled = savedRecordingSaveEnabled === "true";
+        const path = savedRecordingSavePath || "";
+        setRecordingSaveEnabled(enabled);
+        setRecordingSavePath(path);
+        saveRecordingSaveConfig(enabled, path);
+      }
+
+      const savedScreenRecordingEnabled = localStorage.getItem(
+        "screenRecordingEnabled"
+      );
+      if (savedScreenRecordingEnabled !== null) {
+        const enabled = savedScreenRecordingEnabled === "true";
+        setScreenRecordingEnabled(enabled);
+        saveScreenRecordingConfig(enabled);
+      }
+    } catch (err) {
+      console.error("Failed to load settings from localStorage:", err);
+    }
+  };
+
+  const loadScreenRecordingConfig = async () => {
+    try {
+      const enabled = await invoke<boolean>("get_screen_recording_config");
+      setScreenRecordingEnabled(enabled);
+    } catch (err) {
+      console.error("Failed to load screen recording config:", err);
+    }
+  };
+
+  const saveScreenRecordingConfig = async (enabled: boolean) => {
+    try {
+      await invoke("set_screen_recording_config", {
+        enabled,
+      });
+      setScreenRecordingEnabled(enabled);
+      localStorage.setItem("screenRecordingEnabled", enabled.toString());
+    } catch (err) {
+      console.error("Failed to save screen recording config:", err);
+      setError(
+        `画面録画設定エラー: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  };
+
+  useEffect(() => {
+    const unlistenTranscription = listen<TranscriptionSegment>(
       "transcription-segment",
       (event) => {
-        setTranscriptions((prev) => [...prev, event.payload]);
+        const segment = event.payload;
+        setTranscriptions((prev) => {
+          const existingIndex = prev.findIndex(
+            (s) => s.sessionId === segment.sessionId
+          );
+
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            updated[existingIndex] = segment;
+            return updated;
+          } else {
+            return [...prev, segment];
+          }
+        });
       }
     );
 
-    scanForModels();
+    const unlistenVoiceActivity = listen<VoiceActivityEvent>(
+      "voice-activity",
+      (event) => {
+        const { source, isActive } = event.payload;
+        setVoiceActivity((prev) => ({
+          ...prev,
+          [source]: isActive,
+        }));
+      }
+    );
+
+    loadSettingsFromLocalStorage();
+    refreshAllModels();
     loadLanguages();
-    checkMicPermission();
     loadAudioDevices();
-    loadRemoteModels();
+    checkMicPermission();
+    loadStreamingConfig();
+    loadRecordingSaveConfig();
+    loadScreenRecordingConfig();
 
     return () => {
-      unlisten.then((fn) => fn());
+      unlistenTranscription.then((fn) => fn());
+      unlistenVoiceActivity.then((fn) => fn());
     };
-  }, []);
+  }, [loadStreamingConfig]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [transcriptions]);
 
   useEffect(() => {
     if (selectedModel) {
@@ -172,6 +460,11 @@ function App() {
     await loadRemoteModels();
   };
 
+  const handleLanguageChange = (language: string) => {
+    setSelectedLanguage(language);
+    localStorage.setItem("selectedLanguage", language);
+  };
+
   const handleInstallModel = async (modelId: string) => {
     setModelOperations((prev) => ({ ...prev, [modelId]: true }));
     try {
@@ -226,51 +519,41 @@ function App() {
   const toggleMute = async () => {
     console.log("toggleMute", isMuted);
     if (isMuted) {
-      await startRecording();
+      await startMic();
     } else {
-      await stopRecording();
+      await stopMic();
     }
   };
 
-  const startRecording = async () => {
+  const startMic = async () => {
     if (!isInitialized) {
       setError("モデルを初期化中です...");
-      console.log("startRecording", isInitialized);
+      console.log("startMic", isInitialized);
       return;
     }
 
     try {
-      await invoke("start_recording");
+      await invoke("start_mic", {
+        language: selectedLanguage === "auto" ? null : selectedLanguage,
+      });
       setIsMuted(false);
       setError("");
     } catch (err) {
-      console.error("Recording start error:", err);
+      console.error("Mic start error:", err);
       setError(
-        `録音開始エラー: ${err instanceof Error ? err.message : String(err)}`
+        `マイク開始エラー: ${err instanceof Error ? err.message : String(err)}`
       );
     }
   };
 
-  const stopRecording = async () => {
+  const stopMic = async () => {
     setIsMuted(true);
     setIsTranscribing(true);
 
     try {
-      const audioData = await invoke<number[]>("stop_recording");
-
-      if (audioData.length > 0) {
-        await invoke<{
-          success: boolean;
-          text?: string;
-          error?: string;
-        }>("transcribe_audio", {
-          audioData: audioData,
-          language: selectedLanguage === "auto" ? null : selectedLanguage,
-        });
-        // Backend will emit "transcription-segment" event, no need to add manually
-      }
+      await invoke("stop_mic");
     } catch (err) {
-      console.error("Recording stop error:", err);
+      console.error("Mic stop error:", err);
       setError(
         `録音停止エラー: ${err instanceof Error ? err.message : String(err)}`
       );
@@ -339,14 +622,72 @@ function App() {
   return (
     <div className="flex flex-col h-screen w-screen bg-base-100">
       {/* Header */}
-      <header className="flex bg-base-200 border-b border-base-300 px-4 py-1">
+      <header
+        data-tauri-drag-region
+        className="app-header bg-base-100 border-b border-base-200 flex items-center py-1 px-4 gap-4"
+      >
         <div className="flex-1"></div>
-        <button
-          className="btn btn-ghost btn-circle btn-sm"
-          onClick={() => setShowSettings(true)}
-        >
-          <Settings className="w-5 h-5" />
-        </button>
+
+        <div className="flex items-center gap-2 shrink-0">
+          <select
+            value={selectedLanguage}
+            onChange={(e) => handleLanguageChange(e.target.value)}
+            className="select select-bordered select-xs w-24 font-normal"
+          >
+            {availableLanguages.length === 0 ? (
+              <option value="ja">日本語</option>
+            ) : (
+              availableLanguages.map(([code, name]) => (
+                <option key={code} value={code}>
+                  {name}
+                </option>
+              ))
+            )}
+          </select>
+
+          <div className="join">
+            <button
+              className={`join-item btn btn-sm ${
+                !isInitialized || isTranscribing
+                  ? "btn-disabled"
+                  : isMuted
+                  ? "btn-ghost"
+                  : "btn-primary"
+              }`}
+              onClick={toggleMute}
+              disabled={!isInitialized || isTranscribing}
+              title={isMuted ? "マイクON" : "マイクOFF"}
+            >
+              {isMuted ? (
+                <MicOff className="w-4 h-4" />
+              ) : (
+                <Mic className="w-4 h-4" />
+              )}
+            </button>
+
+            <button
+              className={`join-item btn btn-sm ${
+                isRecordingActive ? "btn-error" : "btn-ghost"
+              } ${isRecordingBusy ? "btn-disabled" : ""}`}
+              onClick={toggleRecording}
+              disabled={isRecordingBusy}
+              title={isRecordingActive ? "録画停止" : "録画開始"}
+            >
+              {isRecordingActive ? (
+                <StopCircle className="w-4 h-4" />
+              ) : (
+                <Circle className="w-4 h-4" />
+              )}
+            </button>
+          </div>
+
+          <button
+            className="btn btn-ghost btn-sm btn-square"
+            onClick={() => setShowSettings(true)}
+          >
+            <Settings className="w-4 h-4" />
+          </button>
+        </div>
       </header>
 
       {/* Main Content */}
@@ -358,46 +699,93 @@ function App() {
             </div>
           )}
 
-          {transcriptions.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center text-base-content/50">
-              <div className="text-6xl mb-4 opacity-50">🎤</div>
-              <p className="text-lg mb-2">
-                マイクボタンをクリックして録音を開始
+          {transcriptions.length === 0 &&
+          !voiceActivity.user &&
+          !voiceActivity.system ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-center text-base-content/30 min-h-[50vh]">
+              <MessageSquare className="w-16 h-16 mb-4 opacity-20" />
+              <p className="text-sm font-medium">
+                マイクをオンにして、あなたの声を文字起こしします。
               </p>
-              <p className="text-sm opacity-70">
-                録音を停止すると自動で文字起こしが実行されます
+              <p className="text-sm font-medium">
+                録音/録画をオンにして、システム音声を文字起こしします。
               </p>
             </div>
           ) : (
-            <div className="flex flex-col gap-6 pb-8">
+            <div className="flex flex-col pb-4">
               {transcriptions.map((segment, index) => (
-                <div key={index} className="card bg-base-200 shadow-sm">
-                  <div className="card-body p-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex-1">
-                        <p className="text-sm leading-relaxed">
-                          {segment.text}
-                        </p>
-                        <p className="text-xs opacity-60 mt-2">
-                          {new Date(segment.timestamp).toLocaleTimeString()}
-                        </p>
-                      </div>
-                      {segment.audioData && (
-                        <button
-                          onClick={() => playAudio(segment.audioData!, index)}
-                          className="btn btn-circle btn-sm btn-ghost"
-                        >
-                          {playingIndex === index ? (
-                            <Square className="w-4 h-4" />
-                          ) : (
-                            <Play className="w-4 h-4" />
-                          )}
-                        </button>
-                      )}
-                    </div>
+                <div
+                  key={index}
+                  className={`chat ${
+                    segment.source === "user" ? "chat-end" : "chat-start"
+                  }`}
+                >
+                  <div className="chat-header opacity-50 text-xs flex items-center gap-1 mb-1">
+                    {segment.source === "user" ? "You" : "System"}
+                    <time>
+                      {new Date(segment.timestamp).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </time>
+                  </div>
+                  <div
+                    className={`chat-bubble text-sm ${
+                      segment.source === "user"
+                        ? "chat-bubble-primary"
+                        : "chat-bubble-secondary"
+                    } ${!segment.isFinal ? "opacity-70" : ""}`}
+                  >
+                    {segment.text}
+                    {!segment.isFinal && (
+                      <span className="loading loading-dots loading-xs ml-1 align-bottom"></span>
+                    )}
+                  </div>
+                  <div className="chat-footer opacity-50 flex gap-1 items-center mt-1">
+                    <button
+                      onClick={() =>
+                        navigator.clipboard.writeText(segment.text)
+                      }
+                      className="btn btn-ghost btn-xs btn-circle"
+                      title="コピー"
+                    >
+                      <Copy className="w-3 h-3" />
+                    </button>
+                    {segment.audioData && (
+                      <button
+                        onClick={() => playAudio(segment.audioData!, index)}
+                        className="btn btn-ghost btn-xs btn-circle"
+                      >
+                        {playingIndex === index ? (
+                          <Square className="w-3 h-3" />
+                        ) : (
+                          <Play className="w-3 h-3" />
+                        )}
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
+              {voiceActivity.user &&
+                transcriptions.filter((t) => t.source === "user" && !t.isFinal)
+                  .length === 0 && (
+                  <div className="chat chat-end">
+                    <div className="chat-bubble chat-bubble-primary opacity-70 text-sm">
+                      <span className="loading loading-dots loading-xs"></span>
+                    </div>
+                  </div>
+                )}
+              {voiceActivity.system &&
+                transcriptions.filter(
+                  (t) => t.source === "system" && !t.isFinal
+                ).length === 0 && (
+                  <div className="chat chat-start">
+                    <div className="chat-bubble chat-bubble-secondary opacity-70 text-sm">
+                      <span className="loading loading-dots loading-xs"></span>
+                    </div>
+                  </div>
+                )}
+              <div ref={messagesEndRef} />
             </div>
           )}
 
@@ -410,55 +798,27 @@ function App() {
         </div>
       </main>
 
-      {/* Footer */}
-      <footer className="bg-base-200 border-t border-base-300 h-20 flex items-center">
-        <div className="flex items-center justify-between w-full px-4">
-          <div className="flex-1"></div>
-          <button
-            className={`btn btn-circle btn-lg ${
-              !isInitialized || isTranscribing
-                ? "btn-disabled"
-                : isMuted
-                ? "btn-primary"
-                : "btn-error animate-pulse"
-            }`}
-            onClick={toggleMute}
-            disabled={!isInitialized || isTranscribing}
-          >
-            {isMuted ? (
-              <MicOff className="w-6 h-6" />
-            ) : (
-              <Mic className="w-6 h-6" />
-            )}
-          </button>
-          <div className="flex-1 flex justify-end items-center">
-            <select
-              value={selectedLanguage}
-              onChange={(e) => setSelectedLanguage(e.target.value)}
-              className="select select-bordered select-sm w-32"
-            >
-              {availableLanguages.length === 0 ? (
-                <option value="ja">日本語</option>
-              ) : (
-                availableLanguages.map(([code, name]) => (
-                  <option key={code} value={code}>
-                    {name}
-                  </option>
-                ))
-              )}
-            </select>
-          </div>
-        </div>
-      </footer>
-
       {/* Settings Modal */}
       {showSettings && (
         <dialog className="modal modal-open">
           <div className="modal-box">
-            <h3 className="font-bold text-lg mb-4">設定</h3>
+            <h3 className="font-bold text-lg mb-4 flex items-center justify-between">
+              <span>設定</span>
+              <label className="swap swap-rotate btn btn-ghost btn-circle btn-sm">
+                <input
+                  type="checkbox"
+                  checked={theme === "dark"}
+                  onChange={(e) =>
+                    setTheme(e.target.checked ? "dark" : "light")
+                  }
+                />
+                <Sun className="swap-off w-4 h-4" />
+                <Moon className="swap-on w-4 h-4" />
+              </label>
+            </h3>
 
             <div className="space-y-4">
-              <div className="form-control">
+              {/* <div className="form-control">
                 <label className="label">
                   <span className="label-text">モデル</span>
                 </label>
@@ -473,7 +833,7 @@ function App() {
                     </option>
                   ))}
                 </select>
-              </div>
+              </div> */}
 
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
@@ -520,11 +880,11 @@ function App() {
                               </p>
                             )}
                           </div>
-                          <div className="flex flex-col gap-2 items-end">
+                          <div className="flex flex-row flex-wrap gap-2 items-center justify-end">
                             {model.installed ? (
                               <>
                                 <button
-                                  className="btn btn-xs btn-outline"
+                                  className="btn btn-xs btn-outline text-[11px]"
                                   disabled={
                                     selectedModel === model.path ||
                                     !model.path ||
@@ -536,10 +896,10 @@ function App() {
                                 >
                                   {selectedModel === model.path
                                     ? "使用中"
-                                    : "このモデルを使用"}
+                                    : "使用する"}
                                 </button>
                                 <button
-                                  className="btn btn-xs btn-error"
+                                  className="btn btn-xs btn-error text-[11px]"
                                   onClick={() => handleDeleteModel(model)}
                                   disabled={modelOperations[model.id]}
                                 >
@@ -550,7 +910,7 @@ function App() {
                               </>
                             ) : (
                               <button
-                                className="btn btn-xs btn-primary"
+                                className="btn btn-xs btn-primary text-[11px]"
                                 onClick={() => handleInstallModel(model.id)}
                                 disabled={modelOperations[model.id]}
                               >
@@ -583,6 +943,164 @@ function App() {
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <div className="border border-base-300 rounded-xl p-4 space-y-4">
+                <div className="form-control">
+                  <label className="label cursor-pointer">
+                    <span className="label-text">録画/音声を保存</span>
+                    <input
+                      type="checkbox"
+                      className="toggle toggle-primary"
+                      checked={recordingSaveEnabled}
+                      onChange={(e) =>
+                        saveRecordingSaveConfig(
+                          e.target.checked,
+                          recordingSavePath
+                        )
+                      }
+                    />
+                  </label>
+                </div>
+                {recordingSaveEnabled && (
+                  <div className="form-control">
+                    <label className="label">
+                      <span className="label-text">保存先フォルダ</span>
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="/path/to/save/folder"
+                      value={recordingSavePath}
+                      onChange={(e) => setRecordingSavePath(e.target.value)}
+                      onBlur={() =>
+                        saveRecordingSaveConfig(
+                          recordingSaveEnabled,
+                          recordingSavePath
+                        )
+                      }
+                      className="input input-bordered w-full"
+                    />
+                    <label className="label">
+                      <span className="label-text-alt opacity-70">
+                        録画時はMP4、音声のみの場合はWAVファイルとして保存されます
+                      </span>
+                    </label>
+                  </div>
+                )}
+              </div>
+
+              <div className="border border-base-300 rounded-xl p-4 space-y-4">
+                <div className="form-control">
+                  <label className="label cursor-pointer">
+                    <span className="label-text">画面録画を有効化</span>
+                    <input
+                      type="checkbox"
+                      className="toggle toggle-primary"
+                      checked={screenRecordingEnabled}
+                      onChange={(e) =>
+                        saveScreenRecordingConfig(e.target.checked)
+                      }
+                    />
+                  </label>
+                  <label className="label">
+                    <span className="label-text-alt opacity-70">
+                      有効時は録画ボタンで画面+音声を録画、無効時は音声のみ保存
+                    </span>
+                  </label>
+                </div>
+              </div>
+
+              <div className="border border-base-300 rounded-xl p-4 space-y-4">
+                <div className="flex items-center justify-between">
+                  <span className="label-text font-semibold">
+                    ストリーミング設定
+                  </span>
+                  <button
+                    className={`btn btn-xs ${
+                      isSavingStreamingConfig ? "btn-disabled" : "btn-primary"
+                    }`}
+                    onClick={() => saveStreamingConfig(streamingConfig)}
+                    disabled={isSavingStreamingConfig}
+                  >
+                    {isSavingStreamingConfig ? "保存中..." : "保存"}
+                  </button>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="label">
+                    <span className="label-text">
+                      VAD 閾値 ({streamingConfig.vadThreshold.toFixed(3)})
+                    </span>
+                  </label>
+                  <p className="text-xs opacity-60">
+                    数値が低いほど小さな声でも検知しやすく、高いほど大きな音しか検知しなくなります。
+                  </p>
+                  <input
+                    type="range"
+                    min="0.01"
+                    max="0.99"
+                    step="0.01"
+                    value={streamingConfig.vadThreshold}
+                    onChange={(e) =>
+                      setStreamingConfig((prev) => ({
+                        ...prev,
+                        vadThreshold: parseFloat(e.target.value),
+                      }))
+                    }
+                    className="range range-sm range-primary"
+                  />
+                  <input
+                    type="number"
+                    min="0.01"
+                    max="0.99"
+                    step="0.01"
+                    value={streamingConfig.vadThreshold}
+                    onChange={(e) =>
+                      setStreamingConfig((prev) => ({
+                        ...prev,
+                        vadThreshold: parseFloat(e.target.value) || 0.1,
+                      }))
+                    }
+                    className="input input-bordered input-sm w-32"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="label">
+                    <span className="label-text">文字起こし間隔 (秒)</span>
+                  </label>
+                  <p className="text-xs opacity-60">
+                    短くすると小刻みに更新され、長くするとまとまった文章で届きます。
+                  </p>
+                  <input
+                    type="range"
+                    min="0.5"
+                    max="30"
+                    step="0.5"
+                    value={streamingConfig.partialIntervalSeconds}
+                    onChange={(e) =>
+                      setStreamingConfig((prev) => ({
+                        ...prev,
+                        partialIntervalSeconds: parseFloat(e.target.value),
+                      }))
+                    }
+                    className="range range-sm range-primary"
+                  />
+                  <input
+                    type="number"
+                    min="0.5"
+                    max="30"
+                    step="0.5"
+                    value={streamingConfig.partialIntervalSeconds}
+                    onChange={(e) =>
+                      setStreamingConfig((prev) => ({
+                        ...prev,
+                        partialIntervalSeconds: parseFloat(e.target.value) || 4,
+                      }))
+                    }
+                    className="input input-bordered input-sm w-32"
+                  />
+                </div>
               </div>
 
               {hasMicPermission === false && (

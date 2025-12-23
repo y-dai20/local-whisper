@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::time::Instant;
 use thiserror::Error;
-use whisper_rs::{WhisperContext as WhisperRsContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext as WhisperRsContext, WhisperContextParameters,
+};
 
 #[derive(Error, Debug)]
 pub enum WhisperError {

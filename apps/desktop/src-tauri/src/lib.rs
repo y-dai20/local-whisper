@@ -6,10 +6,17 @@ use parking_lot::Mutex as ParkingMutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use tauri::{AppHandle, Emitter};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use voice_activity_detector::VoiceActivityDetector;
+use hound::{WavWriter, WavSpec};
+
+mod system_audio;
+mod screen_recording;
 
 const REMOTE_MODELS: &[RemoteModel] = &[
     RemoteModel {
@@ -48,13 +55,82 @@ const REMOTE_MODELS: &[RemoteModel] = &[
 
 static WHISPER_CTX: OnceCell<Arc<Mutex<Option<WhisperContext>>>> = OnceCell::new();
 static RECORDING_STATE: OnceCell<Arc<ParkingMutex<RecordingState>>> = OnceCell::new();
+static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCell::new();
+
+const VAD_SAMPLE_RATE: u32 = 16_000;
+const VAD_CHUNK_SIZE: usize = 512;
+const DEFAULT_VAD_THRESHOLD: f32 = 0.1;
+const DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES: usize = 4 * VAD_SAMPLE_RATE as usize;
+const SESSION_MAX_SAMPLES: usize = 30 * VAD_SAMPLE_RATE as usize;
+const SILENCE_TIMEOUT_SAMPLES: usize = 1 * VAD_SAMPLE_RATE as usize;
+const VAD_PRE_BUFFER_MS: usize = 200;
+const VAD_POST_BUFFER_MS: usize = 200;
+const VAD_PRE_BUFFER_SAMPLES: usize = (VAD_SAMPLE_RATE as usize * VAD_PRE_BUFFER_MS) / 1000;
+const VAD_POST_BUFFER_SAMPLES: usize = (VAD_SAMPLE_RATE as usize * VAD_POST_BUFFER_MS) / 1000;
+
+struct SileroVadState {
+    vad: VoiceActivityDetector,
+    pending: Vec<f32>,
+    threshold: f32,
+    pre_buffer: Vec<f32>,
+    post_buffer_remaining: usize,
+    is_voice_active: bool,
+}
 
 struct RecordingState {
     is_recording: bool,
+    is_muted: bool,
+    mic_stream_id: u64,
     audio_buffer: Vec<f32>,
+    session_audio: Vec<f32>,
     sample_rate: u32,
     selected_device_name: Option<String>,
-    recording_id: u64,
+    vad_state: Option<SileroVadState>,
+    session_samples: usize,
+    last_voice_sample: Option<usize>,
+    last_partial_emit_samples: usize,
+    session_id_counter: u64,
+    active_session_id: Option<u64>,
+    transcription_tx: Option<mpsc::Sender<TranscriptionCommand>>,
+    transcription_handle: Option<JoinHandle<()>>,
+    language: Option<String>,
+    vad_threshold: f32,
+    partial_transcript_interval_samples: usize,
+    system_audio_enabled: bool,
+    recording_save_enabled: bool,
+    screen_recording_enabled: bool,
+    screen_recording_active: bool,
+    current_recording_dir: Option<String>,
+    last_vad_event_time: std::time::Instant,
+}
+
+fn default_recording_state() -> RecordingState {
+    RecordingState {
+        is_recording: false,
+        is_muted: true,
+        mic_stream_id: 0,
+        audio_buffer: Vec::new(),
+        session_audio: Vec::new(),
+        sample_rate: VAD_SAMPLE_RATE,
+        selected_device_name: None,
+        vad_state: None,
+        session_samples: 0,
+        last_voice_sample: None,
+        last_partial_emit_samples: 0,
+        session_id_counter: 0,
+        active_session_id: None,
+        transcription_tx: None,
+        transcription_handle: None,
+        language: None,
+        vad_threshold: DEFAULT_VAD_THRESHOLD,
+        partial_transcript_interval_samples: DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES,
+        system_audio_enabled: false,
+        recording_save_enabled: false,
+        screen_recording_enabled: false,
+        screen_recording_active: false,
+        current_recording_dir: None,
+        last_vad_event_time: std::time::Instant::now(),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -63,6 +139,426 @@ struct TranscriptionSegment {
     timestamp: u64,
     #[serde(rename = "audioData")]
     audio_data: Option<Vec<f32>>,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "isFinal")]
+    is_final: bool,
+    source: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct VoiceActivityEvent {
+    source: String,
+    #[serde(rename = "isActive")]
+    is_active: bool,
+    timestamp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StreamingConfig {
+    #[serde(rename = "vadThreshold")]
+    vad_threshold: f32,
+    #[serde(rename = "partialIntervalSeconds")]
+    partial_interval_seconds: f32,
+}
+
+pub(crate) fn emit_transcription_segment(
+    app_handle: &AppHandle,
+    text: String,
+    audio_data: Option<Vec<f32>>,
+    session_id: String,
+    is_final: bool,
+    source: String,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+
+    let segment = TranscriptionSegment {
+        text: text.clone(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        audio_data,
+        session_id: session_id.clone(),
+        is_final,
+        source: source.clone(),
+    };
+
+    // 録画録音中の場合、txtファイルに保存
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+    let state_guard = state.lock();
+    let recording_dir = if state_guard.is_recording {
+        state_guard.current_recording_dir.clone()
+    } else {
+        None
+    };
+    drop(state_guard);
+
+    if is_final {
+        if let Some(recording_dir) = recording_dir {
+            save_transcription_to_txt(&recording_dir, &text, &session_id, &source)?;
+        }
+    }
+
+    app_handle
+        .emit("transcription-segment", &segment)
+        .map_err(|e| e.to_string())
+}
+
+enum TranscriptionCommand {
+    Run {
+        audio: Vec<f32>,
+        language: Option<String>,
+        session_id: String,
+        is_final: bool,
+    },
+    Stop,
+}
+
+fn spawn_transcription_worker(app_handle: AppHandle) -> (mpsc::Sender<TranscriptionCommand>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<TranscriptionCommand>();
+    let handle = thread::spawn(move || {
+        use std::collections::HashMap;
+
+        while let Ok(command) = rx.recv() {
+            match command {
+                TranscriptionCommand::Run {
+                    audio,
+                    language,
+                    session_id,
+                    is_final,
+                } => {
+                    // キューにある全てのコマンドを収集
+                    let mut all_commands = vec![(audio, language, session_id, is_final)];
+                    while let Ok(next_command) = rx.try_recv() {
+                        match next_command {
+                            TranscriptionCommand::Run {
+                                audio: a,
+                                language: l,
+                                session_id: s,
+                                is_final: f,
+                            } => {
+                                all_commands.push((a, l, s, f));
+                            }
+                            TranscriptionCommand::Stop => return,
+                        }
+                    }
+
+                    // セッションごとに最新のリクエストのみを保持
+                    let mut latest_requests: HashMap<String, (Vec<f32>, Option<String>, bool)> = HashMap::new();
+                    let mut final_requests = Vec::new();
+
+                    for (audio, language, session_id, is_final) in all_commands {
+                        if is_final {
+                            // finalリクエストは必ず処理
+                            final_requests.push((audio, language, session_id, is_final));
+                        } else {
+                            // 非finalリクエストは最新のみ保持
+                            latest_requests.insert(session_id, (audio, language, is_final));
+                        }
+                    }
+
+                    // 非finalリクエストを処理
+                    for (session_id, (audio, language, is_final)) in latest_requests {
+                        if let Err(err) = transcribe_and_emit(&audio, language.clone(), session_id.clone(), is_final, &app_handle) {
+                            eprintln!("Transcription worker error: {}", err);
+                        }
+                    }
+
+                    // finalリクエストを処理
+                    for (audio, language, session_id, is_final) in final_requests {
+                        if let Err(err) = transcribe_and_emit(&audio, language.clone(), session_id, is_final, &app_handle) {
+                            eprintln!("Transcription worker error: {}", err);
+                        }
+                    }
+                }
+                TranscriptionCommand::Stop => break,
+            }
+        }
+    });
+    (tx, handle)
+}
+
+fn transcribe_and_emit(
+    audio_data: &[f32],
+    language: Option<String>,
+    session_id: String,
+    is_final: bool,
+    app_handle: &AppHandle,
+) -> Result<(), String> {
+    let ctx_lock = WHISPER_CTX
+        .get()
+        .ok_or_else(|| "Whisper not initialized".to_string())?
+        .clone();
+    let ctx_guard = ctx_lock.lock().unwrap();
+    let ctx = ctx_guard
+        .as_ref()
+        .ok_or_else(|| "Whisper context not available".to_string())?;
+
+    let lang = language.as_deref().unwrap_or("ja");
+    let text = ctx
+        .transcribe_with_language(audio_data, lang)
+        .map_err(|e| e.to_string())?;
+    emit_transcription_segment(
+        app_handle,
+        text,
+        if is_final {
+            Some(audio_data.to_vec())
+        } else {
+            None
+        },
+        session_id,
+        is_final,
+        "user".to_string(),
+    )
+}
+
+fn save_transcription_to_txt(
+    recording_dir: &str,
+    text: &str,
+    session_id: &str,
+    source: &str,
+) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let txt_path = std::path::Path::new(recording_dir).join("transcription.txt");
+
+    let timestamp = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "[{}] Saving transcription to: {} (source: {}, session: {})",
+        timestamp,
+        txt_path.display(),
+        source,
+        session_id,
+    );
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&txt_path)
+        .map_err(|e| format!("Failed to open transcription file: {}", e))?;
+
+    let line = format!("[{}] [{}] {}\n", timestamp, source, text);
+
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("Failed to write transcription: {}", e))?;
+
+    println!("[{}] Successfully wrote transcription to file", timestamp);
+
+    Ok(())
+}
+
+fn setup_recording_directory(state: &mut RecordingState, base_path: &str) -> Result<(), String> {
+    let now = chrono::Local::now();
+    let date_dir = now.format("%Y-%m-%d").to_string();
+    let time_dir = now.format("%H%M%S").to_string();
+    let mut recording_dir = PathBuf::from(base_path);
+    recording_dir.push(&date_dir);
+    recording_dir.push(&time_dir);
+
+    if !recording_dir.exists() {
+        std::fs::create_dir_all(&recording_dir)
+            .map_err(|e| format!("Failed to create recording directory: {}", e))?;
+    }
+
+    state.current_recording_dir = Some(recording_dir.to_string_lossy().to_string());
+    println!("[{}] Recording directory: {}", now.format("%H:%M:%S"), recording_dir.display());
+
+    Ok(())
+}
+
+fn ensure_active_session(state: &mut RecordingState) {
+    if state.active_session_id.is_some() {
+        return;
+    }
+    state.session_id_counter = state.session_id_counter.wrapping_add(1);
+    state.active_session_id = Some(state.session_id_counter);
+    state.session_audio.clear();
+    state.session_samples = 0;
+    state.last_partial_emit_samples = 0;
+    state.last_voice_sample = None;
+    let now = chrono::Local::now();
+    println!(
+        "[{}] Starting session #{}",
+        now.format("%H:%M:%S"),
+        state.session_id_counter
+    );
+}
+
+fn queue_transcription(state: &RecordingState, is_final: bool) {
+    if state.session_audio.is_empty() {
+        return;
+    }
+    let Some(session_id) = state.active_session_id else {
+        return;
+    };
+    let Some(tx) = &state.transcription_tx else {
+        return;
+    };
+    let audio = state.session_audio.clone();
+    let language = state.language.clone();
+    let session_id_str = format!("mic_{}", session_id);
+    if tx
+        .send(TranscriptionCommand::Run {
+            audio,
+            language,
+            session_id: session_id_str,
+            is_final,
+        })
+        .is_err()
+    {
+        eprintln!("Failed to send transcription command");
+    }
+}
+
+fn save_mic_session_audio_to_wav(
+    audio_data: &[f32],
+    session_id: u64,
+    recording_dir: &str,
+) -> Result<(), String> {
+    let start_time = std::time::Instant::now();
+    let now = chrono::Local::now();
+    let timestamp = now.format("%H%M%S");
+    let filename = format!("mic_audio_session_{}_{}.wav", session_id, timestamp);
+
+    let mut path = PathBuf::from(recording_dir);
+
+    println!(
+        "[{}] Saving mic audio to recording directory: {}",
+        now.format("%H:%M:%S"),
+        path.display()
+    );
+
+    if !path.exists() {
+        let now = chrono::Local::now();
+        println!(
+            "[{}] Creating directory: {}",
+            now.format("%H:%M:%S"),
+            path.display()
+        );
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    path.push(filename);
+
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 16000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let now = chrono::Local::now();
+    println!(
+        "[{}] Creating WAV file: {}",
+        now.format("%H:%M:%S"),
+        path.display()
+    );
+
+    let mut writer = WavWriter::create(&path, spec)
+        .map_err(|e| format!("Failed to create WAV file: {}", e))?;
+
+    for &sample in audio_data {
+        let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        writer
+            .write_sample(sample_i16)
+            .map_err(|e| format!("Failed to write sample: {}", e))?;
+    }
+
+    writer
+        .finalize()
+        .map_err(|e| format!("Failed to finalize WAV file: {}", e))?;
+
+    let elapsed = start_time.elapsed();
+    let file_size = std::fs::metadata(&path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let now = chrono::Local::now();
+    println!(
+        "[{}] Successfully saved microphone audio session #{} to: {} ({} bytes, took {:.2}ms)",
+        now.format("%H:%M:%S"),
+        session_id,
+        path.display(),
+        file_size,
+        elapsed.as_secs_f64() * 1000.0
+    );
+
+    Ok(())
+}
+
+fn finalize_active_session(state: &mut RecordingState, reason: &str) {
+    if state.active_session_id.is_none() || state.session_audio.is_empty() {
+        state.active_session_id = None;
+        state.session_audio.clear();
+        state.session_samples = 0;
+        state.last_partial_emit_samples = 0;
+        state.last_voice_sample = None;
+        return;
+    }
+
+    let now = chrono::Local::now();
+    println!(
+        "[{}] Finalizing session #{} ({})",
+        now.format("%H:%M:%S"),
+        state.active_session_id.unwrap(),
+        reason,
+    );
+    queue_transcription(state, true);
+
+    // 録音セッション中のみ音声を保存
+    if state.recording_save_enabled && state.is_recording {
+        if let Some(recording_dir) = &state.current_recording_dir {
+            let audio_clone = state.session_audio.clone();
+            let session_id = state.active_session_id.unwrap();
+            let audio_len = audio_clone.len();
+            let duration = audio_len as f32 / 16000.0;
+            let dir = recording_dir.clone();
+
+            let now = chrono::Local::now();
+            println!(
+                "[{}] Saving microphone audio session #{}: {} samples ({:.2}s) to {}",
+                now.format("%H:%M:%S"),
+                session_id,
+                audio_len,
+                duration,
+                dir
+            );
+
+            std::thread::spawn(move || {
+                if let Err(e) = save_mic_session_audio_to_wav(&audio_clone, session_id, &dir) {
+                    eprintln!("Failed to save microphone audio session: {}", e);
+                }
+            });
+        } else {
+            let now = chrono::Local::now();
+            println!(
+                "[{}] Microphone audio save enabled but no recording directory set",
+                now.format("%H:%M:%S")
+            );
+        }
+    }
+
+    state.active_session_id = None;
+    state.session_audio.clear();
+    state.session_samples = 0;
+    state.last_partial_emit_samples = 0;
+    state.last_voice_sample = None;
+}
+
+fn stop_transcription_worker(state: &mut RecordingState) {
+    if let Some(tx) = state.transcription_tx.take() {
+        let _ = tx.send(TranscriptionCommand::Stop);
+    }
+    if let Some(handle) = state.transcription_handle.take() {
+        let _ = handle.join();
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,16 +679,16 @@ async fn transcribe_audio(
 
     match ctx.transcribe_with_language(&audio_data, lang) {
         Ok(text) => {
-            let segment = TranscriptionSegment {
-                text: text.clone(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-                audio_data: Some(audio_data.clone()),
-            };
-
-            let _ = app_handle.emit("transcription-segment", &segment);
+            if let Err(err) = emit_transcription_segment(
+                &app_handle,
+                text.clone(),
+                Some(audio_data.clone()),
+                "manual_0".to_string(),
+                true,
+                "user".to_string(),
+            ) {
+                eprintln!("Failed to emit transcription segment: {}", err);
+            }
 
             Ok(TranscriptionResult {
                 success: true,
@@ -337,49 +833,55 @@ async fn transcribe_audio_stream(
     let ctx = ctx_guard.as_ref().ok_or("Whisper context not available")?;
 
     ctx.transcribe_with_callback(&audio_f32, |text| {
-        let segment = TranscriptionSegment {
-            text: text.to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            audio_data: Some(audio_f32.clone()),
-        };
-        let _ = app_handle.emit("transcription-segment", &segment);
+        if let Err(err) = emit_transcription_segment(
+            &app_handle,
+            text.to_string(),
+            Some(audio_f32.clone()),
+            "stream_0".to_string(),
+            true,
+            "user".to_string(),
+        ) {
+            eprintln!("Failed to emit transcription segment: {}", err);
+        }
     })
     .map_err(|e| e.to_string())?;
 
     Ok(())
 }
 
-#[tauri::command]
-async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
+async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
     let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(RecordingState {
-            is_recording: false,
-            audio_buffer: Vec::new(),
-            sample_rate: 16000,
-            selected_device_name: None,
-            recording_id: 0,
-        }))
+        Arc::new(ParkingMutex::new(default_recording_state()))
     });
 
-    let (selected_device_name, current_recording_id);
-    {
+    let (selected_device_name, current_mic_stream_id, configured_vad_threshold) = {
         let mut state_guard = state.lock();
-        if state_guard.is_recording {
-            return Err("Already recording".to_string());
-        }
 
-        // Increment recording ID to invalidate old callbacks
-        state_guard.recording_id = state_guard.recording_id.wrapping_add(1);
-        current_recording_id = state_guard.recording_id;
+        stop_transcription_worker(&mut state_guard);
+        let (tx, handle) = spawn_transcription_worker(app_handle.clone());
+        state_guard.transcription_tx = Some(tx);
+        state_guard.transcription_handle = Some(handle);
+        state_guard.language = language.clone();
 
-        selected_device_name = state_guard.selected_device_name.clone();
+        state_guard.mic_stream_id = state_guard.mic_stream_id.wrapping_add(1);
+        let current_mic_stream_id = state_guard.mic_stream_id;
+
+        let selected_device_name = state_guard.selected_device_name.clone();
+        let configured_vad_threshold = state_guard.vad_threshold;
+
+        state_guard.audio_buffer.clear();
+        state_guard.session_audio.clear();
+        state_guard.session_samples = 0;
+        state_guard.last_voice_sample = None;
+        state_guard.last_partial_emit_samples = 0;
+        state_guard.active_session_id = None;
+        state_guard.sample_rate = VAD_SAMPLE_RATE;
 
         let now = chrono::Local::now();
-        println!("[{}] Starting recording #{}", now.format("%H:%M:%S"), current_recording_id);
-    }
+        println!("[{}] Starting mic stream #{}", now.format("%H:%M:%S"), current_mic_stream_id);
+
+        (selected_device_name, current_mic_stream_id, configured_vad_threshold)
+    };
 
     let host = cpal::default_host();
 
@@ -413,7 +915,8 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
             .map(|_| "")
             .unwrap_or(" (default)")
     );
-    let config = device.default_input_config()
+    let config = device
+        .default_input_config()
         .map_err(|e| format!("Failed to get default input config: {}", e))?;
 
     let device_sample_rate = config.sample_rate().0;
@@ -423,6 +926,45 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
     println!("[{}] Recording config - Device sample rate: {}, Channels: {}, Format: {:?}",
              now.format("%H:%M:%S"), device_sample_rate, channels, config.sample_format());
 
+    let vad_state = match VoiceActivityDetector::builder()
+        .sample_rate(VAD_SAMPLE_RATE as i32)
+        .chunk_size(VAD_CHUNK_SIZE)
+        .build()
+    {
+        Ok(vad) => {
+            let now = chrono::Local::now();
+            println!("[{}] Voice Activity Detector initialized", now.format("%H:%M:%S"));
+            Some(SileroVadState {
+                vad,
+                pending: Vec::new(),
+                threshold: configured_vad_threshold,
+                pre_buffer: Vec::new(),
+                post_buffer_remaining: 0,
+                is_voice_active: false,
+            })
+        }
+        Err(err) => {
+            let now = chrono::Local::now();
+            println!(
+                "[{}] Failed to initialize VAD: {err:?}. Falling back to raw audio.",
+                now.format("%H:%M:%S"),
+            );
+            None
+        }
+    };
+
+    {
+        let mut state_guard = state.lock();
+        state_guard.vad_state = vad_state;
+    }
+
+    let now = chrono::Local::now();
+    println!(
+        "[{}] Building audio stream for format {:?}",
+        now.format("%H:%M:%S"),
+        config.sample_format()
+    );
+
     // Build stream with recording ID check to prevent old callbacks from writing
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
@@ -431,13 +973,26 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
             let zero_chunk_count = Arc::new(ParkingMutex::new(0u64));
             let logged_non_zero = Arc::new(ParkingMutex::new(false));
 
+            let app_handle_clone = app_handle.clone();
             device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mut state = state_clone.lock();
-                    if state.is_recording && state.recording_id == current_recording_id {
-                        for &sample in data.iter().step_by(channels) {
-                            state.audio_buffer.push(sample);
+                    if !state.is_muted && state.mic_stream_id == current_mic_stream_id {
+                        ensure_active_session(&mut state);
+                        let mono_samples: Vec<f32> = data.iter().step_by(channels).copied().collect();
+                        let processed_samples = if device_sample_rate == VAD_SAMPLE_RATE {
+                            mono_samples
+                        } else {
+                            resample_audio(&mono_samples, device_sample_rate, VAD_SAMPLE_RATE)
+                        };
+                        for sample in processed_samples {
+                            push_sample_with_optional_vad(&mut state, sample, &app_handle_clone);
+                        }
+
+                        if state.session_samples >= SESSION_MAX_SAMPLES {
+                            finalize_active_session(&mut state, "session_max_duration");
+                            ensure_active_session(&mut state);
                         }
                         let chunk_max = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                         if chunk_max == 0.0 {
@@ -472,7 +1027,7 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
                             let now = chrono::Local::now();
                             println!("[{}] Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
                                      now.format("%H:%M:%S"), *count, data.len(),
-                                     state.audio_buffer.len(), state.audio_buffer.len() as f32 / device_sample_rate as f32);
+                                     state.audio_buffer.len(), state.audio_buffer.len() as f32 / VAD_SAMPLE_RATE as f32);
                         }
                     }
                 },
@@ -483,14 +1038,31 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
         cpal::SampleFormat::I16 => {
             let state_clone = state.clone();
             let callback_count = Arc::new(ParkingMutex::new(0u64));
+            let app_handle_clone = app_handle.clone();
 
             device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let mut state = state_clone.lock();
-                    if state.is_recording && state.recording_id == current_recording_id {
-                        for &sample in data.iter().step_by(channels) {
-                            state.audio_buffer.push(sample as f32 / 32768.0);
+                    if !state.is_muted && state.mic_stream_id == current_mic_stream_id {
+                        ensure_active_session(&mut state);
+                        let mono_samples: Vec<f32> = data
+                            .iter()
+                            .step_by(channels)
+                            .map(|&sample| sample as f32 / i16::MAX as f32)
+                            .collect();
+                        let processed_samples = if device_sample_rate == VAD_SAMPLE_RATE {
+                            mono_samples
+                        } else {
+                            resample_audio(&mono_samples, device_sample_rate, VAD_SAMPLE_RATE)
+                        };
+                        for sample in processed_samples {
+                            push_sample_with_optional_vad(&mut state, sample, &app_handle_clone);
+                        }
+
+                        if state.session_samples >= SESSION_MAX_SAMPLES {
+                            finalize_active_session(&mut state, "session_max_duration");
+                            ensure_active_session(&mut state);
                         }
                         let mut count = callback_count.lock();
                         *count += 1;
@@ -498,7 +1070,7 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
                             let now = chrono::Local::now();
                             println!("[{}] Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
                                      now.format("%H:%M:%S"), *count, data.len(),
-                                     state.audio_buffer.len(), state.audio_buffer.len() as f32 / device_sample_rate as f32);
+                                     state.audio_buffer.len(), state.audio_buffer.len() as f32 / VAD_SAMPLE_RATE as f32);
                         }
                     }
                 },
@@ -509,29 +1081,80 @@ async fn start_recording(_app_handle: AppHandle) -> Result<(), String> {
         _ => {
             return Err("Unsupported sample format".to_string());
         }
-    }.map_err(|e| format!("Failed to build stream: {}", e))?;
+    }.map_err(|e| {
+        let now = chrono::Local::now();
+        println!(
+            "[{}] Failed to build audio stream: {}",
+            now.format("%H:%M:%S"),
+            e
+        );
+        format!("Failed to build stream: {}", e)
+    })?;
 
-    stream.play().map_err(|e| format!("Failed to start stream: {}", e))?;
+    let now = chrono::Local::now();
+    println!("[{}] Starting audio stream…", now.format("%H:%M:%S"));
+
+    stream.play().map_err(|e| {
+        let now = chrono::Local::now();
+        println!(
+            "[{}] Failed to start audio stream: {}",
+            now.format("%H:%M:%S"),
+            e
+        );
+        format!("Failed to start stream: {}", e)
+    })?;
+
+    let now = chrono::Local::now();
+    println!("[{}] Audio stream started successfully", now.format("%H:%M:%S"));
 
     {
         let mut state_guard = state.lock();
-        state_guard.is_recording = true;
         state_guard.audio_buffer.clear();
-        state_guard.sample_rate = device_sample_rate;
+        state_guard.sample_rate = VAD_SAMPLE_RATE;
     }
 
-    // Leak the stream to keep it alive - it will be invalidated by recording_id on next recording
-    // This prevents Send trait issues while ensuring old callbacks can't write to new recordings
+    // Leak the stream to keep it alive - it will be invalidated by mic_stream_id on next stream
+    // This prevents Send trait issues while ensuring old callbacks can't write to new streams
     std::mem::forget(stream);
 
     let now = chrono::Local::now();
-    println!("[{}] Recording started successfully", now.format("%H:%M:%S"));
+    println!("[{}] Mic stream started successfully", now.format("%H:%M:%S"));
 
     Ok(())
 }
 
 #[tauri::command]
-async fn stop_recording(_app_handle: AppHandle) -> Result<Vec<f32>, String> {
+async fn start_recording(_app_handle: AppHandle, _language: Option<String>) -> Result<(), String> {
+    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+
+    let mut state_guard = state.lock();
+    if state_guard.is_recording {
+        return Err("Already recording".to_string());
+    }
+
+    let now = chrono::Local::now();
+    println!("[{}] Starting recording session...", now.format("%H:%M:%S"));
+
+    state_guard.is_recording = true;
+
+    if state_guard.recording_save_enabled {
+        let save_path = RECORDING_SAVE_PATH.get_or_init(|| {
+            Arc::new(ParkingMutex::new(None))
+        });
+        let path_guard = save_path.lock();
+        if let Some(base_path) = path_guard.as_ref() {
+            setup_recording_directory(&mut state_guard, base_path)?;
+        }
+    }
+
+    let now = chrono::Local::now();
+    println!("[{}] Recording session started", now.format("%H:%M:%S"));
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_recording() -> Result<(), String> {
     let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
 
     let mut state_guard = state.lock();
@@ -539,69 +1162,236 @@ async fn stop_recording(_app_handle: AppHandle) -> Result<Vec<f32>, String> {
         return Err("Not recording".to_string());
     }
 
+    let now = chrono::Local::now();
+    println!("[{}] Stopping recording session...", now.format("%H:%M:%S"));
+
     state_guard.is_recording = false;
-    let device_sample_rate = state_guard.sample_rate;
+    state_guard.current_recording_dir = None;
 
     let now = chrono::Local::now();
-    println!("[{}] Stopping recording, waiting for stream...", now.format("%H:%M:%S"));
+    println!("[{}] Recording session stopped", now.format("%H:%M:%S"));
 
-    // Wait for stream thread to finish and drop the stream
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    Ok(())
+}
 
-    let audio_data = std::mem::take(&mut state_guard.audio_buffer);
-    drop(state_guard);
-    let sample_count = audio_data.len();
+#[tauri::command]
+async fn start_mic(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
 
-    let now = chrono::Local::now();
-    println!("[{}] Recording stopped - captured {} samples ({:.2} seconds at {}Hz)",
-             now.format("%H:%M:%S"), sample_count, sample_count as f32 / device_sample_rate as f32, device_sample_rate);
-
-    if sample_count == 0 {
-        return Err("No audio data captured".to_string());
+    {
+        let mut state_guard = state.lock();
+        if !state_guard.is_muted {
+            return Ok(());
+        }
+        state_guard.is_muted = false;
     }
 
-    // Check audio data statistics
-    let non_zero_count = audio_data.iter().filter(|&&s| s.abs() > 0.0001).count();
-    let max_amplitude = audio_data.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
-    let avg_amplitude = audio_data.iter().map(|&s| s.abs()).sum::<f32>() / audio_data.len() as f32;
-
     let now = chrono::Local::now();
-    println!("[{}] Audio stats - Non-zero samples: {}/{} ({:.1}%), Max amplitude: {:.4}, Avg amplitude: {:.4}",
-             now.format("%H:%M:%S"), non_zero_count, sample_count,
-             (non_zero_count as f32 / sample_count as f32) * 100.0,
-             max_amplitude, avg_amplitude);
+    println!("[{}] Microphone unmuted", now.format("%H:%M:%S"));
 
-    // Show first 10 samples
-    let now = chrono::Local::now();
-    print!("[{}] First 10 samples: ", now.format("%H:%M:%S"));
-    for i in 0..10.min(audio_data.len()) {
-        print!("{:.4} ", audio_data[i]);
+    start_mic_stream(app_handle, language).await?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_mic() -> Result<(), String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let mut state_guard = state.lock();
+    if state_guard.is_muted {
+        return Ok(());
     }
-    println!();
 
-    // Resample to 16kHz if needed
-    let resampled_data = if device_sample_rate != 16000 {
-        let now = chrono::Local::now();
-        println!("[{}] Resampling from {}Hz to 16000Hz...", now.format("%H:%M:%S"), device_sample_rate);
-        let resampled = resample_audio(&audio_data, device_sample_rate, 16000);
+    state_guard.is_muted = true;
 
-        // Check resampled data
-        let max_resampled = resampled.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
-        let avg_resampled = resampled.iter().map(|&s| s.abs()).sum::<f32>() / resampled.len() as f32;
-        let now = chrono::Local::now();
-        println!("[{}] Resampled stats - Max: {:.4}, Avg: {:.4}",
-                 now.format("%H:%M:%S"), max_resampled, avg_resampled);
+    finalize_active_session(&mut state_guard, "mic_stopped");
+    stop_transcription_worker(&mut state_guard);
+    flush_vad_pending(&mut state_guard);
+    state_guard.vad_state = None;
 
-        resampled
-    } else {
-        audio_data
+    let now = chrono::Local::now();
+    println!("[{}] Microphone muted", now.format("%H:%M:%S"));
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_mic_status() -> Result<bool, String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let state_guard = state.lock();
+    Ok(!state_guard.is_muted)
+}
+
+fn process_vad_chunk_only(
+    vad_state: &mut SileroVadState,
+    chunk: &[f32],
+) -> Result<f32, String> {
+    let chunk_i16: Vec<i16> = chunk
+        .iter()
+        .map(|&sample| (sample * i16::MAX as f32) as i16)
+        .collect();
+    let probability = vad_state.vad.predict(chunk_i16);
+    Ok(probability)
+}
+
+pub(crate) fn emit_voice_activity_event(app_handle: &AppHandle, source: &str, is_active: bool) {
+    let event = VoiceActivityEvent {
+        source: source.to_string(),
+        is_active,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
     };
+    if let Err(e) = app_handle.emit("voice-activity", &event) {
+        eprintln!("Failed to emit voice activity event: {}", e);
+    }
+}
 
-    let now = chrono::Local::now();
-    println!("[{}] Final audio: {} samples ({:.2} seconds at 16kHz)",
-             now.format("%H:%M:%S"), resampled_data.len(), resampled_data.len() as f32 / 16000.0);
+fn push_sample_with_optional_vad(state: &mut RecordingState, sample: f32, app_handle: &AppHandle) {
+    state.session_samples += 1;
 
-    Ok(resampled_data)
+    if state.vad_state.is_none() {
+        state.audio_buffer.push(sample);
+        state.session_audio.push(sample);
+        state.last_voice_sample = Some(state.session_samples);
+    } else {
+        let mut disable_vad = false;
+        let mut voice_detected = false;
+
+        if let Some(vad_state) = state.vad_state.as_mut() {
+            vad_state.pending.push(sample);
+
+            while vad_state.pending.len() >= VAD_CHUNK_SIZE {
+                let chunk: Vec<f32> = vad_state.pending.drain(..VAD_CHUNK_SIZE).collect();
+                match process_vad_chunk_only(vad_state, &chunk) {
+                    Ok(prob) => {
+                        let voice_in_chunk = prob > vad_state.threshold;
+
+                        if voice_in_chunk {
+                            // 音声検出: プレバッファの内容を先に追加
+                            if !vad_state.is_voice_active && !vad_state.pre_buffer.is_empty() {
+                                state.audio_buffer.extend_from_slice(&vad_state.pre_buffer);
+                                state.session_audio.extend_from_slice(&vad_state.pre_buffer);
+                                vad_state.pre_buffer.clear();
+                            }
+
+                            // 現在のチャンクを追加
+                            state.audio_buffer.extend_from_slice(&chunk);
+                            state.session_audio.extend_from_slice(&chunk);
+                            voice_detected = true;
+                            vad_state.is_voice_active = true;
+                            vad_state.post_buffer_remaining = VAD_POST_BUFFER_SAMPLES;
+                        } else {
+                            // 音声未検出
+                            if vad_state.is_voice_active && vad_state.post_buffer_remaining > 0 {
+                                // ポストバッファ期間中: 音声として追加
+                                state.audio_buffer.extend_from_slice(&chunk);
+                                state.session_audio.extend_from_slice(&chunk);
+                                vad_state.post_buffer_remaining = vad_state.post_buffer_remaining.saturating_sub(chunk.len());
+
+                                if vad_state.post_buffer_remaining == 0 {
+                                    vad_state.is_voice_active = false;
+                                }
+                            } else {
+                                // プレバッファに保存（最大200ms分）
+                                vad_state.pre_buffer.extend_from_slice(&chunk);
+                                if vad_state.pre_buffer.len() > VAD_PRE_BUFFER_SAMPLES {
+                                    let excess = vad_state.pre_buffer.len() - VAD_PRE_BUFFER_SAMPLES;
+                                    vad_state.pre_buffer.drain(0..excess);
+                                }
+                                vad_state.is_voice_active = false;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("Silero VAD failed, disabling VAD: {}", err);
+                        state.audio_buffer.extend_from_slice(&chunk);
+                        state.session_audio.extend_from_slice(&chunk);
+                        disable_vad = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if disable_vad {
+            state.vad_state = None;
+        }
+
+        if voice_detected {
+            state.last_voice_sample = Some(state.session_samples);
+        }
+    }
+
+    // Emit periodic VAD voice activity events every 500ms
+    let now = std::time::Instant::now();
+    if now.duration_since(state.last_vad_event_time).as_millis() >= 500 {
+        let is_voice_active = state.vad_state.as_ref().map_or(false, |v| v.is_voice_active);
+        emit_voice_activity_event(app_handle, "user", is_voice_active);
+        state.last_vad_event_time = now;
+    }
+
+    if let Some(last_voice) = state.last_voice_sample {
+        if state.session_samples - last_voice >= SILENCE_TIMEOUT_SAMPLES {
+            finalize_active_session(state, "silence_timeout");
+            ensure_active_session(state);
+        }
+    }
+
+    if state.session_samples - state.last_partial_emit_samples
+        >= state.partial_transcript_interval_samples
+    {
+        queue_transcription(state, false);
+        state.last_partial_emit_samples = state.session_samples;
+    }
+}
+
+fn flush_vad_pending(state: &mut RecordingState) {
+    if state.vad_state.is_none() {
+        return;
+    }
+
+    let mut disable_vad = false;
+    if let Some(vad_state) = state.vad_state.as_mut() {
+        if vad_state.pending.is_empty() {
+            return;
+        }
+
+        let mut chunk = vad_state.pending.clone();
+        let original_len = chunk.len();
+        vad_state.pending.clear();
+        if chunk.len() < VAD_CHUNK_SIZE {
+            chunk.resize(VAD_CHUNK_SIZE, 0.0);
+        }
+
+        match process_vad_chunk_only(vad_state, &chunk) {
+            Ok(prob) => {
+                if prob >= vad_state.threshold {
+                    state.audio_buffer.extend_from_slice(&chunk[..original_len]);
+                    state.session_audio.extend_from_slice(&chunk[..original_len]);
+                }
+            }
+            Err(err) => {
+                eprintln!("Silero VAD failed during flush: {}", err);
+                state.audio_buffer.extend_from_slice(&chunk[..original_len]);
+                state.session_audio.extend_from_slice(&chunk[..original_len]);
+                disable_vad = true;
+            }
+        }
+    }
+
+    if disable_vad {
+        state.vad_state = None;
+    }
 }
 
 #[tauri::command]
@@ -640,13 +1430,7 @@ async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
 #[tauri::command]
 async fn select_audio_device(device_name: String) -> Result<(), String> {
     let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(RecordingState {
-            is_recording: false,
-            audio_buffer: Vec::new(),
-            sample_rate: 16000,
-            selected_device_name: None,
-            recording_id: 0,
-        }))
+        Arc::new(ParkingMutex::new(default_recording_state()))
     });
 
     let mut state_guard = state.lock();
@@ -654,6 +1438,51 @@ async fn select_audio_device(device_name: String) -> Result<(), String> {
 
     let now = chrono::Local::now();
     println!("[{}] Selected audio device: {}", now.format("%H:%M:%S"), device_name);
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_streaming_config() -> Result<StreamingConfig, String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let state_guard = state.lock();
+    Ok(StreamingConfig {
+        vad_threshold: state_guard.vad_threshold,
+        partial_interval_seconds: state_guard.partial_transcript_interval_samples as f32
+            / VAD_SAMPLE_RATE as f32,
+    })
+}
+
+#[tauri::command]
+async fn set_streaming_config(config: StreamingConfig) -> Result<(), String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let mut state_guard = state.lock();
+    let clamped_threshold = config.vad_threshold.clamp(0.01, 0.99);
+    let clamped_interval_seconds = config.partial_interval_seconds.clamp(0.5, 30.0);
+    let samples = ((clamped_interval_seconds * VAD_SAMPLE_RATE as f32).round() as usize).max(1);
+
+    state_guard.vad_threshold = clamped_threshold;
+    state_guard.partial_transcript_interval_samples = samples;
+    state_guard.last_partial_emit_samples = 0;
+
+    if let Some(vad_state) = state_guard.vad_state.as_mut() {
+        vad_state.threshold = clamped_threshold;
+    }
+
+    let now = chrono::Local::now();
+    println!(
+        "[{}] Updated streaming config: threshold {:.4}, partial interval {:.2}s ({} samples)",
+        now.format("%H:%M:%S"),
+        clamped_threshold,
+        clamped_interval_seconds,
+        samples
+    );
 
     Ok(())
 }
@@ -679,6 +1508,165 @@ async fn check_microphone_permission() -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn start_system_audio(app_handle: AppHandle) -> Result<(), String> {
+    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+    system_audio::start_system_audio_capture(state.clone(), app_handle)
+}
+
+#[tauri::command]
+async fn stop_system_audio() -> Result<(), String> {
+    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+    system_audio::stop_system_audio_capture(state.clone())
+}
+
+#[tauri::command]
+async fn get_system_audio_status() -> Result<bool, String> {
+    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+    let state_guard = state.lock();
+    Ok(state_guard.system_audio_enabled)
+}
+
+#[tauri::command]
+async fn set_recording_save_config(enabled: bool, path: Option<String>) -> Result<(), String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let mut state_guard = state.lock();
+    state_guard.recording_save_enabled = enabled;
+    drop(state_guard);
+
+    let save_path = RECORDING_SAVE_PATH.get_or_init(|| {
+        Arc::new(ParkingMutex::new(None))
+    });
+    let mut path_guard = save_path.lock();
+    *path_guard = path.clone();
+    drop(path_guard);
+
+    let now = chrono::Local::now();
+    if enabled {
+        if let Some(p) = &path {
+            println!("[{}] Recording save enabled: {}", now.format("%H:%M:%S"), p);
+        }
+    } else {
+        println!("[{}] Recording save disabled", now.format("%H:%M:%S"));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_recording_save_config() -> Result<(bool, Option<String>), String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let state_guard = state.lock();
+    let enabled = state_guard.recording_save_enabled;
+    drop(state_guard);
+
+    let save_path = RECORDING_SAVE_PATH.get_or_init(|| {
+        Arc::new(ParkingMutex::new(None))
+    });
+    let path_guard = save_path.lock();
+    let path = path_guard.clone();
+
+    Ok((enabled, path))
+}
+
+#[tauri::command]
+async fn set_screen_recording_config(enabled: bool) -> Result<(), String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let mut state_guard = state.lock();
+    state_guard.screen_recording_enabled = enabled;
+
+    let now = chrono::Local::now();
+    if enabled {
+        println!("[{}] Screen recording enabled", now.format("%H:%M:%S"));
+    } else {
+        println!("[{}] Screen recording disabled", now.format("%H:%M:%S"));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_screen_recording_config() -> Result<bool, String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let state_guard = state.lock();
+    Ok(state_guard.screen_recording_enabled)
+}
+
+#[tauri::command]
+async fn start_screen_recording() -> Result<(), String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let mut state_guard = state.lock();
+
+    if state_guard.recording_save_enabled {
+        let save_path = RECORDING_SAVE_PATH.get_or_init(|| {
+            Arc::new(ParkingMutex::new(None))
+        });
+        let path_guard = save_path.lock();
+        if let Some(base_path) = path_guard.as_ref() {
+            setup_recording_directory(&mut state_guard, base_path)?;
+        }
+    }
+
+    let recording_dir = state_guard.current_recording_dir.clone();
+    state_guard.screen_recording_active = true;
+    drop(state_guard);
+
+    if let Some(dir) = recording_dir {
+        let now = chrono::Local::now();
+        let timestamp = now.format("%Y%m%d_%H%M%S");
+        let filename = format!("screen_recording_{}.mp4", timestamp);
+        let full_path = std::path::Path::new(&dir).join(filename);
+
+        println!(
+            "[{}] Starting screen recording to: {}",
+            now.format("%H:%M:%S"),
+            full_path.display()
+        );
+
+        screen_recording::start_screen_recording(full_path.to_str().unwrap())
+    } else {
+        Err("Recording directory not set".to_string())
+    }
+}
+
+#[tauri::command]
+async fn stop_screen_recording() -> Result<(), String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let mut state_guard = state.lock();
+    state_guard.screen_recording_active = false;
+    drop(state_guard);
+
+    screen_recording::stop_screen_recording()
+}
+
+#[tauri::command]
+async fn get_screen_recording_status() -> Result<bool, String> {
+    let state = RECORDING_STATE.get_or_init(|| {
+        Arc::new(ParkingMutex::new(default_recording_state()))
+    });
+
+    let state_guard = state.lock();
+    Ok(state_guard.screen_recording_active)
+}
+
+#[tauri::command]
 async fn get_supported_languages() -> Result<Vec<(String, String)>, String> {
     Ok(vec![
         ("auto".to_string(), "自動検出".to_string()),
@@ -695,31 +1683,14 @@ async fn get_supported_languages() -> Result<Vec<(String, String)>, String> {
     ])
 }
 
-// Linear resampling with simple low-pass pre-filter to avoid aliasing
+// Linear resampling without aggressive filtering to preserve amplitude
 fn resample_audio(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate {
         return input.to_vec();
     }
 
-    // Simple moving-average low-pass filter when downsampling
-    let filtered: Vec<f32> = if from_rate > to_rate {
-        let window = (from_rate / to_rate).max(2) as usize;
-        let mut acc = 0.0f32;
-        let mut filtered = Vec::with_capacity(input.len());
-        for (i, &sample) in input.iter().enumerate() {
-            acc += sample;
-            if i >= window {
-                acc -= input[i - window];
-            }
-            filtered.push(acc / window as f32);
-        }
-        filtered
-    } else {
-        input.to_vec()
-    };
-
     let ratio = from_rate as f64 / to_rate as f64;
-    let output_len = ((filtered.len() as f64) / ratio).ceil() as usize;
+    let output_len = ((input.len() as f64) / ratio).ceil() as usize;
     let mut output = Vec::with_capacity(output_len);
 
     for i in 0..output_len {
@@ -727,12 +1698,12 @@ fn resample_audio(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
         let idx = src_pos.floor() as usize;
         let frac = src_pos - idx as f64;
 
-        if idx + 1 < filtered.len() {
-            let sample = filtered[idx] as f64 * (1.0 - frac)
-                + filtered[idx + 1] as f64 * frac;
+        if idx + 1 < input.len() {
+            let sample = input[idx] as f64 * (1.0 - frac)
+                + input[idx + 1] as f64 * frac;
             output.push(sample as f32);
-        } else if idx < filtered.len() {
-            output.push(filtered[idx]);
+        } else if idx < input.len() {
+            output.push(input[idx]);
         }
     }
 
@@ -750,13 +1721,28 @@ pub fn run() {
             transcribe_audio_stream,
             start_recording,
             stop_recording,
+            start_mic,
+            stop_mic,
+            get_mic_status,
             get_supported_languages,
-            list_audio_devices,
-            select_audio_device,
-            check_microphone_permission,
             list_remote_models,
             install_model,
-            delete_model
+            delete_model,
+            list_audio_devices,
+            select_audio_device,
+            get_streaming_config,
+            set_streaming_config,
+            set_recording_save_config,
+            get_recording_save_config,
+            set_screen_recording_config,
+            get_screen_recording_config,
+            start_screen_recording,
+            stop_screen_recording,
+            get_screen_recording_status,
+            check_microphone_permission,
+            start_system_audio,
+            stop_system_audio,
+            get_system_audio_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
