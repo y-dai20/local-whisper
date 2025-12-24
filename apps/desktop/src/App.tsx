@@ -818,7 +818,7 @@ function App() {
             </h3>
 
             <div className="space-y-4">
-              {/* <div className="form-control">
+              <div className="form-control">
                 <label className="label">
                   <span className="label-text">モデル</span>
                 </label>
@@ -833,7 +833,7 @@ function App() {
                     </option>
                   ))}
                 </select>
-              </div> */}
+              </div>
 
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
