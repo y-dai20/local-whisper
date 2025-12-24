@@ -3,7 +3,7 @@
 Apple Silicon (M1/M2/M3) 向けに最適化した、完全ローカル動作の高精度・低遅延文字起こしアプリです。
 Web 会議や YouTube などのシステム音声も、マイク入力も、そのままテキスト化できます。
 
-https://github.com/user-attachments/assets/402253cf-a4e6-493c-95c7-a45b916474e2
+https://assets.neosophie.com/local-whisper.mp4
 
 ## なにができる？
 
