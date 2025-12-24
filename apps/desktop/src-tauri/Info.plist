@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>このアプリは音声を文字起こしするためにマイクへのアクセスが必要です。</string>
+
+  <!-- システム音声拾う/画面収録系を将来やるなら（必要時だけ） -->
+  <!-- <key>NSCameraUsageDescription</key>
+  <string>（必要なら）</string> -->
+</dict>
+</plist>

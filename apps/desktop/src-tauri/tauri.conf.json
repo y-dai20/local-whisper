@@ -30,9 +30,6 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "macOS": {
-      "infoPlist": "NSMicrophoneUsageDescription=このアプリは音声を文字起こしするためにマイクへのアクセスが必要です。"
-    }
+    ]
   }
 }
