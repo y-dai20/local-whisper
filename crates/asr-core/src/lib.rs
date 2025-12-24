@@ -50,6 +50,8 @@ impl WhisperContext {
         params.set_language(Some(language));
         params.set_n_threads(num_cpus());
         params.set_single_segment(false);
+        params.set_audio_ctx(512);
+        params.set_temperature(0.0);
 
         let inference_start = Instant::now();
         state.full(params, audio_data)
