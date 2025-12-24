@@ -1,28 +1,30 @@
 # Local Whisper
 
-Apple Silicon (M1/M2/M3) 向けに最適化した、完全ローカル動作の高精度・低遅延文字起こしアプリです。
-Web 会議や YouTube などのシステム音声も、マイク入力も、そのままテキスト化できます。
+[🇯🇵 日本語版 README](./README.ja.md)
 
-## なにができる？
+Local Whisper is a high-accuracy, low-latency transcription app that runs entirely on Apple Silicon (M1/M2/M3).
+It captures both microphone input and system audio (e.g., web meetings, YouTube) without sending data to the cloud.
 
-- 🔒 **完全ローカル** – ネットワークアクセス不要。機密音声も安心。
-- ⚡ **低遅延** – whisper.cpp ベースの最適化で、Apple Silicon の CPU/GPU を無駄なく活用。
-- 🎧 **音声ソースを選べる** – マイク入力とシステム音声入力をワンタップで切り替え。
-- 🎥 **録画もできる** – Web 会議や配信をキャプチャして、そのまま文字起こしに活用。
-- 🗣️ **日本語に強い** – 長時間の会議記録や動画も安定して文字起こし。
-- 🪄 **モデルを UI から選択** – base / small / medium / large v3 turbo を切り替えて精度と速度を調整。
+## Highlights
 
-## 必要環境
+- 🔒 **Fully offline** – No network access required, keeping sensitive audio on your machine.
+- ⚡ **Optimized for low latency** – Built on whisper.cpp to make the most of Apple Silicon’s CPU/GPU.
+- 🎧 **Flexible sources** – Switch between microphone input and system audio with one tap.
+- 🎥 **Screen/audio capture ready** – Record meetings or streams and transcribe them immediately.
+- 🗣️ **Japanese-first experience** – Tuned for long-form Japanese speech, but works for other languages too.
+- 🪄 **UI-selectable models** – Choose between base / small / medium / large v3 turbo directly from the interface.
 
-- Apple Silicon 搭載 Mac（macOS 13 以上推奨）
-- Rust 1.70+
-- Node.js 18+
+## Requirements
+
+- Apple Silicon Mac (macOS 13+ recommended)
+- Rust 1.70 or later
+- Node.js 18 or later
 - pnpm
-- C++ コンパイラ（whisper.cpp のビルド用）
+- A C++ compiler (for building whisper.cpp)
 
-## セットアップ
+## Setup
 
-1. **リポジトリを取得**
+1. **Clone the repository**
 
    ```bash
    git clone <repository-url>
@@ -30,49 +32,49 @@ Web 会議や YouTube などのシステム音声も、マイク入力も、そ�
    git submodule update --init --recursive
    ```
 
-2. **依存関係をインストール**
+2. **Install dependencies**
 
    ```bash
    cd apps/desktop
    pnpm install
    ```
 
-3. **開発モードで起動**
+3. **Run in development mode**
    ```bash
    pnpm tauri dev
    ```
-   ビルド済みバイナリが欲しい場合は `pnpm tauri build` を利用してください。
+   Need a packaged build? Run `pnpm tauri build`.
 
-## モデル選択のヒント
+## Model selection tips
 
-| モデル         | 特徴                   | 想定用途                          |
-| -------------- | ---------------------- | --------------------------------- |
-| base           | バランス型。初期設定。 | 日常的な会議や動画視聴            |
-| small          | base より高精度        | 長時間の会議メモ                  |
-| medium         | さらに高精度           | 医療/法律など誤差を減らしたい場面 |
-| large v3 turbo | 最高精度ながら高速     | 字幕生成やアーカイブ用途          |
+| Model          | Characteristics                   | Suggested use case                                              |
+| -------------- | --------------------------------- | --------------------------------------------------------------- |
+| base           | Balanced default                  | Everyday meetings, casual videos                                |
+| small          | Higher accuracy than base         | Long meeting notes                                              |
+| medium         | Even higher accuracy              | Fields that require fewer transcription errors (legal, medical) |
+| large v3 turbo | Highest accuracy while still fast | Subtitle generation, archival transcripts                       |
 
-モデルはアプリ内のプルダウンから即時切り替えできます。
-精度重視なら `medium / large v3 turbo`、レスポンス優先なら `base` を選ぶのがおすすめです。
+Switch models from the in-app dropdown at any time.
+Pick `medium` or `large v3 turbo` when accuracy matters most; choose `base` for faster turnaround.
 
-## 使い方
+## How to use
 
-1. `pnpm tauri dev` でアプリを起動。
-2. 入力ソースを **マイク** か **システム音声** から選択。
-3. [開始] でリアルタイム文字起こしを開始。必要に応じて [停止]。
-4. テキストはその場でコピーしたり、ログとして保存できます。
+1. Start the app with `pnpm tauri dev`.
+2. Select the input source (**Microphone** or **System Audio**).
+3. Hit **Start** to begin live transcription, and **Stop** when finished.
+4. Copy results instantly or save them as logs.
 
-## トラブルシューティング
+## Troubleshooting
 
-- **音声が取得できない**: macOS の「システム設定 > プライバシーとセキュリティ > マイク」でアプリの権限を許可してください。
-- **パフォーマンスが出ない**: 一時的に別モデルへ切り替え、または他の重いアプリを終了して CPU/GPU 負荷を下げてください。
+- **No audio detected**: Check macOS “System Settings → Privacy & Security → Microphone” and allow access for the app.
+- **Slow performance**: Temporarily switch to a lighter model or close other CPU/GPU-intensive applications.
 
-## 謝辞
+## Credits
 
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
 - [OpenAI Whisper](https://github.com/openai/whisper)
 - [Tauri](https://tauri.app/)
 
-## ライセンス
+## License
 
-本プロジェクトは [MIT License](./LICENSE) で提供されています。
+Distributed under the [MIT License](./LICENSE).
