@@ -222,7 +222,7 @@ enum TranscriptionCommand {
 fn spawn_transcription_worker(app_handle: AppHandle) -> (mpsc::Sender<TranscriptionCommand>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<TranscriptionCommand>();
     let handle = thread::spawn(move || {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
 
         while let Ok(command) = rx.recv() {
             match command {
@@ -251,10 +251,12 @@ fn spawn_transcription_worker(app_handle: AppHandle) -> (mpsc::Sender<Transcript
                     // セッションごとに最新のリクエストのみを保持
                     let mut latest_requests: HashMap<String, (Vec<f32>, Option<String>, bool)> = HashMap::new();
                     let mut final_requests = Vec::new();
+                    let mut sessions_with_final = HashSet::new();
 
                     for (audio, language, session_id, is_final) in all_commands {
                         if is_final {
                             // finalリクエストは必ず処理
+                            sessions_with_final.insert(session_id.clone());
                             final_requests.push((audio, language, session_id, is_final));
                         } else {
                             // 非finalリクエストは最新のみ保持
@@ -264,6 +266,9 @@ fn spawn_transcription_worker(app_handle: AppHandle) -> (mpsc::Sender<Transcript
 
                     // 非finalリクエストを処理
                     for (session_id, (audio, language, is_final)) in latest_requests {
+                        if sessions_with_final.contains(&session_id) {
+                            continue;
+                        }
                         if let Err(err) = transcribe_and_emit(&audio, language.clone(), session_id.clone(), is_final, &app_handle) {
                             eprintln!("Transcription worker error: {}", err);
                         }
