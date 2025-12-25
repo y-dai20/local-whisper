@@ -247,6 +247,11 @@ function App() {
 
   const loadSettingsFromLocalStorage = () => {
     try {
+      const savedModelPath = localStorage.getItem("selectedModelPath");
+      if (savedModelPath) {
+        setSelectedModel(savedModelPath);
+      }
+
       const savedLanguage = localStorage.getItem("selectedLanguage");
       if (savedLanguage) {
         setSelectedLanguage(savedLanguage);
@@ -368,6 +373,14 @@ function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcriptions]);
+
+  useEffect(() => {
+    if (selectedModel) {
+      localStorage.setItem("selectedModelPath", selectedModel);
+    } else {
+      localStorage.removeItem("selectedModelPath");
+    }
+  }, [selectedModel]);
 
   useEffect(() => {
     if (selectedModel) {
