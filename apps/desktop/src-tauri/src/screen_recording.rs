@@ -15,7 +15,11 @@ pub fn start_screen_recording(output_path: &str) -> Result<(), String> {
 
         let now = chrono::Local::now();
         if result == 0 {
-            println!("[{}] Screen recording started: {}", now.format("%H:%M:%S"), output_path);
+            println!(
+                "[{}] Screen recording started: {}",
+                now.format("%H:%M:%S"),
+                output_path
+            );
             Ok(())
         } else if result == -2 {
             Err("Screen recording requires macOS 13.0+".to_string())

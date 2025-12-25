@@ -57,6 +57,11 @@ interface VoiceActivityEvent {
   timestamp: number;
 }
 
+interface WhisperParamsConfig {
+  audioCtx: number;
+  temperature: number;
+}
+
 function App() {
   const [isMuted, setIsMuted] = useState(true);
   const [isInitialized, setIsInitialized] = useState(false);
@@ -94,6 +99,11 @@ function App() {
     partialIntervalSeconds: 4,
   });
   const [isSavingStreamingConfig, setIsSavingStreamingConfig] = useState(false);
+  const [whisperParams, setWhisperParams] = useState<WhisperParamsConfig>({
+    audioCtx: 512,
+    temperature: 0,
+  });
+  const [isSavingWhisperParams, setIsSavingWhisperParams] = useState(false);
   const [recordingSaveEnabled, setRecordingSaveEnabled] = useState(false);
   const [recordingSavePath, setRecordingSavePath] = useState("");
   const [screenRecordingEnabled, setScreenRecordingEnabled] = useState(false);
@@ -114,6 +124,11 @@ function App() {
     try {
       const config = await invoke<StreamingConfig>("get_streaming_config");
       setStreamingConfig(config);
+      localStorage.setItem("vadThreshold", config.vadThreshold.toString());
+      localStorage.setItem(
+        "partialIntervalSeconds",
+        config.partialIntervalSeconds.toString()
+      );
     } catch (err) {
       console.error("Failed to load streaming config:", err);
     }
@@ -128,10 +143,12 @@ function App() {
         });
         setStreamingConfig(config);
         localStorage.setItem("vadThreshold", config.vadThreshold.toString());
-        localStorage.setItem(
-          "partialIntervalSeconds",
-          config.partialIntervalSeconds.toString()
-        );
+        if (config.partialIntervalSeconds) {
+          localStorage.setItem(
+            "partialIntervalSeconds",
+            config.partialIntervalSeconds.toString()
+          );
+        }
       } catch (err) {
         console.error("Failed to save streaming config:", err);
         setError(
@@ -141,6 +158,44 @@ function App() {
         );
       } finally {
         setIsSavingStreamingConfig(false);
+      }
+    },
+    [setError]
+  );
+
+  const loadWhisperParams = useCallback(async () => {
+    try {
+      const params = await invoke<WhisperParamsConfig>("get_whisper_params");
+      setWhisperParams(params);
+      localStorage.setItem("whisperAudioCtx", params.audioCtx.toString());
+      localStorage.setItem("whisperTemperature", params.temperature.toString());
+    } catch (err) {
+      console.error("Failed to load Whisper params:", err);
+    }
+  }, []);
+
+  const saveWhisperParams = useCallback(
+    async (params: WhisperParamsConfig) => {
+      setIsSavingWhisperParams(true);
+      try {
+        await invoke("set_whisper_params", {
+          config: params,
+        });
+        setWhisperParams(params);
+        localStorage.setItem("whisperAudioCtx", params.audioCtx.toString());
+        localStorage.setItem(
+          "whisperTemperature",
+          params.temperature.toString()
+        );
+      } catch (err) {
+        console.error("Failed to save Whisper params:", err);
+        setError(
+          `Whisper設定エラー: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      } finally {
+        setIsSavingWhisperParams(false);
       }
     },
     [setError]
@@ -272,6 +327,25 @@ function App() {
         }));
       }
 
+      const savedAudioCtx = localStorage.getItem("whisperAudioCtx");
+      const savedTemperature = localStorage.getItem("whisperTemperature");
+      if (savedAudioCtx || savedTemperature) {
+        setWhisperParams((prev) => {
+          const updated = {
+            audioCtx: savedAudioCtx
+              ? parseInt(savedAudioCtx, 10)
+              : prev.audioCtx,
+            temperature: savedTemperature
+              ? parseFloat(savedTemperature)
+              : prev.temperature,
+          };
+          invoke("set_whisper_params", { config: updated }).catch((err) =>
+            console.error("Failed to reapply Whisper params:", err)
+          );
+          return updated;
+        });
+      }
+
       const savedRecordingSaveEnabled = localStorage.getItem(
         "recordingSaveEnabled"
       );
@@ -361,6 +435,7 @@ function App() {
     loadAudioDevices();
     checkMicPermission();
     loadStreamingConfig();
+    loadWhisperParams();
     loadRecordingSaveConfig();
     loadScreenRecordingConfig();
 
@@ -368,7 +443,7 @@ function App() {
       unlistenTranscription.then((fn) => fn());
       unlistenVoiceActivity.then((fn) => fn());
     };
-  }, [loadStreamingConfig]);
+  }, [loadStreamingConfig, loadWhisperParams]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1020,6 +1095,103 @@ function App() {
                       有効時は録画ボタンで画面+音声を録画、無効時は音声のみ保存
                     </span>
                   </label>
+                </div>
+              </div>
+
+              <div className="border border-base-300 rounded-xl p-4 space-y-4">
+                <div className="flex items-center justify-between">
+                  <span className="label-text font-semibold">
+                    Whisper モデル設定
+                  </span>
+                  <button
+                    className={`btn btn-xs ${
+                      isSavingWhisperParams ? "btn-disabled" : "btn-primary"
+                    }`}
+                    onClick={() => saveWhisperParams(whisperParams)}
+                    disabled={isSavingWhisperParams}
+                  >
+                    {isSavingWhisperParams ? "保存中..." : "保存"}
+                  </button>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="label">
+                    <span className="label-text">
+                      コンテキスト長 (audio_ctx: {whisperParams.audioCtx})
+                    </span>
+                  </label>
+                  <p className="text-xs opacity-60">
+                    長くするほど過去の音声を参照できますが、計算量とメモリ使用量が増えます。
+                  </p>
+                  <input
+                    type="range"
+                    min="64"
+                    max="1500"
+                    step="32"
+                    value={whisperParams.audioCtx}
+                    onChange={(e) =>
+                      setWhisperParams((prev) => ({
+                        ...prev,
+                        audioCtx: parseInt(e.target.value, 10) || prev.audioCtx,
+                      }))
+                    }
+                    className="range range-sm range-primary"
+                  />
+                  <input
+                    type="number"
+                    min="64"
+                    max="1500"
+                    step="32"
+                    value={whisperParams.audioCtx}
+                    onChange={(e) =>
+                      setWhisperParams((prev) => ({
+                        ...prev,
+                        audioCtx: parseInt(e.target.value, 10) || prev.audioCtx,
+                      }))
+                    }
+                    className="input input-bordered input-sm w-32"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="label">
+                    <span className="label-text">
+                      温度 (temperature: {whisperParams.temperature.toFixed(2)})
+                    </span>
+                  </label>
+                  <p className="text-xs opacity-60">
+                    数値を上げると出力が多様になります。0に近いほど安定した結果になります。
+                  </p>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={whisperParams.temperature}
+                    onChange={(e) =>
+                      setWhisperParams((prev) => ({
+                        ...prev,
+                        temperature:
+                          parseFloat(e.target.value) ?? prev.temperature,
+                      }))
+                    }
+                    className="range range-sm range-primary"
+                  />
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={whisperParams.temperature}
+                    onChange={(e) =>
+                      setWhisperParams((prev) => ({
+                        ...prev,
+                        temperature:
+                          parseFloat(e.target.value) ?? prev.temperature,
+                      }))
+                    }
+                    className="input input-bordered input-sm w-32"
+                  />
                 </div>
               </div>
 

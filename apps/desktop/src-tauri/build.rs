@@ -16,12 +16,7 @@ fn main() {
             println!("cargo:rerun-if-changed={}", file);
         }
 
-        let mut args = vec![
-            "-emit-library",
-            "-static",
-            "-o",
-            &lib_path,
-        ];
+        let mut args = vec!["-emit-library", "-static", "-o", &lib_path];
         args.extend(swift_files.iter().map(|s| *s));
         args.extend([
             "-sdk",

@@ -5,6 +5,30 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext as WhisperRsContext, WhisperContextParameters,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub struct WhisperParams {
+    pub audio_ctx: i32,
+    pub temperature: f32,
+}
+
+impl Default for WhisperParams {
+    fn default() -> Self {
+        Self {
+            audio_ctx: 512,
+            temperature: 0.0,
+        }
+    }
+}
+
+impl WhisperParams {
+    pub fn clamped(self) -> Self {
+        Self {
+            audio_ctx: self.audio_ctx.clamp(64, 1500),
+            temperature: self.temperature.clamp(0.0, 1.0),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum WhisperError {
     #[error("Failed to initialize context: {0}")]
@@ -17,6 +41,7 @@ pub enum WhisperError {
 
 pub struct WhisperContext {
     ctx: WhisperRsContext,
+    params: WhisperParams,
 }
 
 impl WhisperContext {
@@ -25,20 +50,40 @@ impl WhisperContext {
         ctx_params.use_gpu(true).flash_attn(true);
 
         let ctx = WhisperRsContext::new_with_params(
-            model_path.as_ref().to_str().ok_or(WhisperError::InvalidModelPath)?,
+            model_path
+                .as_ref()
+                .to_str()
+                .ok_or(WhisperError::InvalidModelPath)?,
             ctx_params,
         )
-            .map_err(|e| WhisperError::InitializationFailed(e.to_string()))?;
+        .map_err(|e| WhisperError::InitializationFailed(e.to_string()))?;
 
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            params: WhisperParams::default(),
+        })
     }
 
     pub fn transcribe(&self, audio_data: &[f32]) -> Result<String, WhisperError> {
         self.transcribe_with_language(audio_data, "ja")
     }
 
-    pub fn transcribe_with_language(&self, audio_data: &[f32], language: &str) -> Result<String, WhisperError> {
-        let mut state = self.ctx.create_state()
+    pub fn set_params(&mut self, params: WhisperParams) {
+        self.params = params.clamped();
+    }
+
+    pub fn params(&self) -> WhisperParams {
+        self.params
+    }
+
+    pub fn transcribe_with_language(
+        &self,
+        audio_data: &[f32],
+        language: &str,
+    ) -> Result<String, WhisperError> {
+        let mut state = self
+            .ctx
+            .create_state()
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -50,11 +95,12 @@ impl WhisperContext {
         params.set_language(Some(language));
         params.set_n_threads(num_cpus());
         params.set_single_segment(false);
-        params.set_audio_ctx(512);
-        params.set_temperature(0.0);
+        params.set_audio_ctx(self.params.audio_ctx);
+        params.set_temperature(self.params.temperature);
 
         let inference_start = Instant::now();
-        state.full(params, audio_data)
+        state
+            .full(params, audio_data)
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
         let inference_elapsed = inference_start.elapsed();
         println!(
@@ -63,12 +109,14 @@ impl WhisperContext {
             audio_data.len()
         );
 
-        let num_segments = state.full_n_segments()
+        let num_segments = state
+            .full_n_segments()
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
 
         let mut full_text = String::new();
         for i in 0..num_segments {
-            let segment = state.full_get_segment_text(i)
+            let segment = state
+                .full_get_segment_text(i)
                 .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
             full_text.push_str(&segment);
         }
@@ -96,7 +144,9 @@ impl WhisperContext {
     where
         F: FnMut(&str),
     {
-        let mut state = self.ctx.create_state()
+        let mut state = self
+            .ctx
+            .create_state()
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -108,9 +158,12 @@ impl WhisperContext {
         params.set_language(Some(language));
         params.set_n_threads(num_cpus());
         params.set_single_segment(false);
+        params.set_audio_ctx(self.params.audio_ctx);
+        params.set_temperature(self.params.temperature);
 
         let inference_start = Instant::now();
-        state.full(params, audio_data)
+        state
+            .full(params, audio_data)
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
         let inference_elapsed = inference_start.elapsed();
         println!(
@@ -119,7 +172,8 @@ impl WhisperContext {
             audio_data.len()
         );
 
-        let num_segments = state.full_n_segments()
+        let num_segments = state
+            .full_n_segments()
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
 
         for i in 0..num_segments {

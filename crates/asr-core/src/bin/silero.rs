@@ -63,7 +63,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
 fn read_mono_audio(path: &str, expected_rate: u32) -> Result<Vec<f32>> {
     let mut reader = WavReader::open(path).context("Failed to open WAV file")?;
     let spec = reader.spec();
@@ -89,4 +88,3 @@ fn read_mono_audio(path: &str, expected_rate: u32) -> Result<Vec<f32>> {
     };
     Ok(samples)
 }
-

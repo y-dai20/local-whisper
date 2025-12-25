@@ -1,12 +1,12 @@
+use hound::{WavSpec, WavWriter};
 use parking_lot::Mutex as ParkingMutex;
 use std::os::raw::c_int;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::path::PathBuf;
 use tauri::AppHandle;
 use voice_activity_detector::VoiceActivityDetector;
-use hound::{WavWriter, WavSpec};
 
 extern "C" {
     fn system_audio_start(callback: extern "C" fn(*const f32, c_int)) -> c_int;
@@ -89,7 +89,8 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
             0.0
         };
 
-        let total_samples = SAMPLE_COUNTER.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
+        let total_samples =
+            SAMPLE_COUNTER.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
         let mut last_log = LAST_LOG_INSTANT.lock().unwrap();
         let now = Instant::now();
         let should_log = last_log
@@ -101,10 +102,7 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
             let timestamp = chrono::Local::now().format("%H:%M:%S");
             println!(
                 "[{}] System audio: received {} samples (total {:.2}s, RMS {:.4})",
-                timestamp,
-                count,
-                total_seconds,
-                rms
+                timestamp, count, total_seconds, rms
             );
             *last_log = Some(now);
         }
@@ -142,7 +140,10 @@ fn process_system_audio_sample(
 
     while session.vad_pending.len() >= VAD_CHUNK_SIZE {
         let chunk: Vec<f32> = session.vad_pending.drain(..VAD_CHUNK_SIZE).collect();
-        let chunk_i16: Vec<i16> = chunk.iter().map(|&s| (s * i16::MAX as f32) as i16).collect();
+        let chunk_i16: Vec<i16> = chunk
+            .iter()
+            .map(|&s| (s * i16::MAX as f32) as i16)
+            .collect();
 
         let probability = session.vad.predict(chunk_i16);
 
@@ -177,7 +178,9 @@ fn process_system_audio_sample(
         ensure_system_audio_session(session);
     }
 
-    if session.session_samples - session.last_partial_emit_samples >= session.partial_transcript_interval_samples {
+    if session.session_samples - session.last_partial_emit_samples
+        >= session.partial_transcript_interval_samples
+    {
         queue_system_audio_transcription(session, false, app_handle, language);
         session.last_partial_emit_samples = session.session_samples;
     }
@@ -380,7 +383,9 @@ pub fn start_system_audio_capture(
     }
 }
 
-pub fn stop_system_audio_capture(state: Arc<ParkingMutex<super::RecordingState>>) -> Result<(), String> {
+pub fn stop_system_audio_capture(
+    state: Arc<ParkingMutex<super::RecordingState>>,
+) -> Result<(), String> {
     unsafe {
         let result = system_audio_stop();
 
@@ -427,8 +432,7 @@ fn save_session_audio_to_wav(
             now.format("%H:%M:%S"),
             path.display()
         );
-        std::fs::create_dir_all(&path)
-            .map_err(|e| format!("Failed to create directory: {}", e))?;
+        std::fs::create_dir_all(&path).map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
     path.push(filename);
@@ -447,8 +451,8 @@ fn save_session_audio_to_wav(
         path.display()
     );
 
-    let mut writer = WavWriter::create(&path, spec)
-        .map_err(|e| format!("Failed to create WAV file: {}", e))?;
+    let mut writer =
+        WavWriter::create(&path, spec).map_err(|e| format!("Failed to create WAV file: {}", e))?;
 
     for &sample in audio_data {
         let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
@@ -462,9 +466,7 @@ fn save_session_audio_to_wav(
         .map_err(|e| format!("Failed to finalize WAV file: {}", e))?;
 
     let elapsed = start_time.elapsed();
-    let file_size = std::fs::metadata(&path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     let now = chrono::Local::now();
     println!(

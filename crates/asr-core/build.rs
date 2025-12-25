@@ -14,7 +14,8 @@ fn main() {
         return;
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let ggml_path = manifest_dir.join("../../vendor/whisper.cpp/ggml/src");
     let default_path = ggml_path.join("ggml-metal");
 

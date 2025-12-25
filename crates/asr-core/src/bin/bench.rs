@@ -30,10 +30,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let model_load_start = Instant::now();
     let ctx = WhisperContext::new(model_path)?;
-    println!(
-        "Model loaded in {:.2?}",
-        model_load_start.elapsed()
-    );
+    println!("Model loaded in {:.2?}", model_load_start.elapsed());
 
     let (audio, sample_rate) = load_wav(Path::new(audio_path))?;
     println!(

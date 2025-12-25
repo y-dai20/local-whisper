@@ -1,6 +1,7 @@
-use asr_core::WhisperContext;
+use asr_core::{WhisperContext, WhisperParams};
 use chrono;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use hound::{WavSpec, WavWriter};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex as ParkingMutex;
 use reqwest::Client;
@@ -13,10 +14,9 @@ use tauri::{AppHandle, Emitter};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use voice_activity_detector::VoiceActivityDetector;
-use hound::{WavWriter, WavSpec};
 
-mod system_audio;
 mod screen_recording;
+mod system_audio;
 
 const REMOTE_MODELS: &[RemoteModel] = &[
     RemoteModel {
@@ -54,6 +54,7 @@ const REMOTE_MODELS: &[RemoteModel] = &[
 ];
 
 static WHISPER_CTX: OnceCell<Arc<Mutex<Option<WhisperContext>>>> = OnceCell::new();
+static WHISPER_PARAMS: OnceCell<Arc<ParkingMutex<WhisperParams>>> = OnceCell::new();
 static RECORDING_STATE: OnceCell<Arc<ParkingMutex<RecordingState>>> = OnceCell::new();
 static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCell::new();
 
@@ -162,6 +163,32 @@ struct StreamingConfig {
     partial_interval_seconds: f32,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+struct WhisperParamsConfig {
+    #[serde(rename = "audioCtx")]
+    audio_ctx: i32,
+    temperature: f32,
+}
+
+impl From<WhisperParams> for WhisperParamsConfig {
+    fn from(params: WhisperParams) -> Self {
+        Self {
+            audio_ctx: params.audio_ctx,
+            temperature: params.temperature,
+        }
+    }
+}
+
+impl From<WhisperParamsConfig> for WhisperParams {
+    fn from(config: WhisperParamsConfig) -> Self {
+        WhisperParams {
+            audio_ctx: config.audio_ctx,
+            temperature: config.temperature,
+        }
+        .clamped()
+    }
+}
+
 pub(crate) fn emit_transcription_segment(
     app_handle: &AppHandle,
     text: String,
@@ -187,9 +214,8 @@ pub(crate) fn emit_transcription_segment(
     };
 
     // 録画録音中の場合、txtファイルに保存
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
     let state_guard = state.lock();
     let recording_dir = if state_guard.is_recording {
         state_guard.current_recording_dir.clone()
@@ -219,7 +245,9 @@ enum TranscriptionCommand {
     Stop,
 }
 
-fn spawn_transcription_worker(app_handle: AppHandle) -> (mpsc::Sender<TranscriptionCommand>, JoinHandle<()>) {
+fn spawn_transcription_worker(
+    app_handle: AppHandle,
+) -> (mpsc::Sender<TranscriptionCommand>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<TranscriptionCommand>();
     let handle = thread::spawn(move || {
         use std::collections::{HashMap, HashSet};
@@ -249,7 +277,8 @@ fn spawn_transcription_worker(app_handle: AppHandle) -> (mpsc::Sender<Transcript
                     }
 
                     // セッションごとに最新のリクエストのみを保持
-                    let mut latest_requests: HashMap<String, (Vec<f32>, Option<String>, bool)> = HashMap::new();
+                    let mut latest_requests: HashMap<String, (Vec<f32>, Option<String>, bool)> =
+                        HashMap::new();
                     let mut final_requests = Vec::new();
                     let mut sessions_with_final = HashSet::new();
 
@@ -269,14 +298,26 @@ fn spawn_transcription_worker(app_handle: AppHandle) -> (mpsc::Sender<Transcript
                         if sessions_with_final.contains(&session_id) {
                             continue;
                         }
-                        if let Err(err) = transcribe_and_emit(&audio, language.clone(), session_id.clone(), is_final, &app_handle) {
+                        if let Err(err) = transcribe_and_emit(
+                            &audio,
+                            language.clone(),
+                            session_id.clone(),
+                            is_final,
+                            &app_handle,
+                        ) {
                             eprintln!("Transcription worker error: {}", err);
                         }
                     }
 
                     // finalリクエストを処理
                     for (audio, language, session_id, is_final) in final_requests {
-                        if let Err(err) = transcribe_and_emit(&audio, language.clone(), session_id, is_final, &app_handle) {
+                        if let Err(err) = transcribe_and_emit(
+                            &audio,
+                            language.clone(),
+                            session_id,
+                            is_final,
+                            &app_handle,
+                        ) {
                             eprintln!("Transcription worker error: {}", err);
                         }
                     }
@@ -372,7 +413,11 @@ fn setup_recording_directory(state: &mut RecordingState, base_path: &str) -> Res
     }
 
     state.current_recording_dir = Some(recording_dir.to_string_lossy().to_string());
-    println!("[{}] Recording directory: {}", now.format("%H:%M:%S"), recording_dir.display());
+    println!(
+        "[{}] Recording directory: {}",
+        now.format("%H:%M:%S"),
+        recording_dir.display()
+    );
 
     Ok(())
 }
@@ -446,8 +491,7 @@ fn save_mic_session_audio_to_wav(
             now.format("%H:%M:%S"),
             path.display()
         );
-        std::fs::create_dir_all(&path)
-            .map_err(|e| format!("Failed to create directory: {}", e))?;
+        std::fs::create_dir_all(&path).map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
     path.push(filename);
@@ -466,8 +510,8 @@ fn save_mic_session_audio_to_wav(
         path.display()
     );
 
-    let mut writer = WavWriter::create(&path, spec)
-        .map_err(|e| format!("Failed to create WAV file: {}", e))?;
+    let mut writer =
+        WavWriter::create(&path, spec).map_err(|e| format!("Failed to create WAV file: {}", e))?;
 
     for &sample in audio_data {
         let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
@@ -481,9 +525,7 @@ fn save_mic_session_audio_to_wav(
         .map_err(|e| format!("Failed to finalize WAV file: {}", e))?;
 
     let elapsed = start_time.elapsed();
-    let file_size = std::fs::metadata(&path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     let now = chrono::Local::now();
     println!(
@@ -655,7 +697,14 @@ async fn scan_models() -> Result<Vec<ModelInfo>, String> {
 
 #[tauri::command]
 async fn initialize_whisper(model_path: String) -> Result<String, String> {
-    let ctx = WhisperContext::new(&model_path).map_err(|e| e.to_string())?;
+    let params_state =
+        WHISPER_PARAMS.get_or_init(|| Arc::new(ParkingMutex::new(WhisperParams::default())));
+
+    let mut ctx = WhisperContext::new(&model_path).map_err(|e| e.to_string())?;
+    {
+        let params_guard = params_state.lock();
+        ctx.set_params(*params_guard);
+    }
 
     WHISPER_CTX
         .get_or_init(|| Arc::new(Mutex::new(None)))
@@ -666,16 +715,53 @@ async fn initialize_whisper(model_path: String) -> Result<String, String> {
     Ok("Whisper initialized successfully".to_string())
 }
 
+fn whisper_params_state() -> Arc<ParkingMutex<WhisperParams>> {
+    WHISPER_PARAMS
+        .get_or_init(|| Arc::new(ParkingMutex::new(WhisperParams::default())))
+        .clone()
+}
+
+#[tauri::command]
+async fn get_whisper_params() -> Result<WhisperParamsConfig, String> {
+    let state = whisper_params_state();
+    let guard = state.lock();
+    Ok(WhisperParamsConfig::from(*guard))
+}
+
+#[tauri::command]
+async fn set_whisper_params(config: WhisperParamsConfig) -> Result<(), String> {
+    let params: WhisperParams = config.into();
+    let state = whisper_params_state();
+    {
+        let mut guard = state.lock();
+        *guard = params;
+    }
+
+    if let Some(ctx_lock) = WHISPER_CTX.get() {
+        let mut ctx_guard = ctx_lock.lock().unwrap();
+        if let Some(ctx) = ctx_guard.as_mut() {
+            ctx.set_params(params);
+        }
+    }
+
+    let now = chrono::Local::now();
+    println!(
+        "[{}] Updated Whisper params: audio_ctx {}, temperature {:.2}",
+        now.format("%H:%M:%S"),
+        params.audio_ctx,
+        params.temperature
+    );
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn transcribe_audio(
     audio_data: Vec<f32>,
     language: Option<String>,
     app_handle: AppHandle,
 ) -> Result<TranscriptionResult, String> {
-    let ctx_lock = WHISPER_CTX
-        .get()
-        .ok_or("Whisper not initialized")?
-        .clone();
+    let ctx_lock = WHISPER_CTX.get().ok_or("Whisper not initialized")?.clone();
 
     let ctx_guard = ctx_lock.lock().unwrap();
     let ctx = ctx_guard.as_ref().ok_or("Whisper context not available")?;
@@ -715,9 +801,12 @@ async fn list_remote_models() -> Result<Vec<RemoteModelStatus>, String> {
     let mut statuses = Vec::new();
 
     for remote in REMOTE_MODELS {
-        let installed_entry = installed
-            .iter()
-            .find(|m| Path::new(&m.path).file_name().map(|n| n == remote.filename).unwrap_or(false));
+        let installed_entry = installed.iter().find(|m| {
+            Path::new(&m.path)
+                .file_name()
+                .map(|n| n == remote.filename)
+                .unwrap_or(false)
+        });
 
         statuses.push(RemoteModelStatus {
             id: remote.id.to_string(),
@@ -827,10 +916,7 @@ async fn transcribe_audio_stream(
     audio_data: Vec<i16>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
-    let ctx_lock = WHISPER_CTX
-        .get()
-        .ok_or("Whisper not initialized")?
-        .clone();
+    let ctx_lock = WHISPER_CTX.get().ok_or("Whisper not initialized")?.clone();
 
     let audio_f32 = asr_core::convert_pcm_to_f32(&audio_data);
 
@@ -855,9 +941,8 @@ async fn transcribe_audio_stream(
 }
 
 async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let (selected_device_name, current_mic_stream_id, configured_vad_threshold) = {
         let mut state_guard = state.lock();
@@ -883,9 +968,17 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         state_guard.sample_rate = VAD_SAMPLE_RATE;
 
         let now = chrono::Local::now();
-        println!("[{}] Starting mic stream #{}", now.format("%H:%M:%S"), current_mic_stream_id);
+        println!(
+            "[{}] Starting mic stream #{}",
+            now.format("%H:%M:%S"),
+            current_mic_stream_id
+        );
 
-        (selected_device_name, current_mic_stream_id, configured_vad_threshold)
+        (
+            selected_device_name,
+            current_mic_stream_id,
+            configured_vad_threshold,
+        )
     };
 
     let host = cpal::default_host();
@@ -893,7 +986,11 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     // Use selected device or default
     let device = if let Some(device_name) = &selected_device_name {
         let now = chrono::Local::now();
-        println!("[{}] Looking for device: {}", now.format("%H:%M:%S"), device_name);
+        println!(
+            "[{}] Looking for device: {}",
+            now.format("%H:%M:%S"),
+            device_name
+        );
 
         host.input_devices()
             .map_err(|e| format!("Failed to enumerate devices: {}", e))?
@@ -909,7 +1006,9 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         host.default_input_device()
             .ok_or("No input device available")?
     };
-    let device_name = device.name().unwrap_or_else(|_| "Unknown device".to_string());
+    let device_name = device
+        .name()
+        .unwrap_or_else(|_| "Unknown device".to_string());
     let now = chrono::Local::now();
     println!(
         "[{}] Using input device: {}{}",
@@ -928,8 +1027,13 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     let channels = config.channels() as usize;
 
     let now = chrono::Local::now();
-    println!("[{}] Recording config - Device sample rate: {}, Channels: {}, Format: {:?}",
-             now.format("%H:%M:%S"), device_sample_rate, channels, config.sample_format());
+    println!(
+        "[{}] Recording config - Device sample rate: {}, Channels: {}, Format: {:?}",
+        now.format("%H:%M:%S"),
+        device_sample_rate,
+        channels,
+        config.sample_format()
+    );
 
     let vad_state = match VoiceActivityDetector::builder()
         .sample_rate(VAD_SAMPLE_RATE as i32)
@@ -938,7 +1042,10 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     {
         Ok(vad) => {
             let now = chrono::Local::now();
-            println!("[{}] Voice Activity Detector initialized", now.format("%H:%M:%S"));
+            println!(
+                "[{}] Voice Activity Detector initialized",
+                now.format("%H:%M:%S")
+            );
             Some(SileroVadState {
                 vad,
                 pending: Vec::new(),
@@ -1110,7 +1217,10 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     })?;
 
     let now = chrono::Local::now();
-    println!("[{}] Audio stream started successfully", now.format("%H:%M:%S"));
+    println!(
+        "[{}] Audio stream started successfully",
+        now.format("%H:%M:%S")
+    );
 
     {
         let mut state_guard = state.lock();
@@ -1123,7 +1233,10 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     std::mem::forget(stream);
 
     let now = chrono::Local::now();
-    println!("[{}] Mic stream started successfully", now.format("%H:%M:%S"));
+    println!(
+        "[{}] Mic stream started successfully",
+        now.format("%H:%M:%S")
+    );
 
     Ok(())
 }
@@ -1143,9 +1256,7 @@ async fn start_recording(_app_handle: AppHandle, _language: Option<String>) -> R
     state_guard.is_recording = true;
 
     if state_guard.recording_save_enabled {
-        let save_path = RECORDING_SAVE_PATH.get_or_init(|| {
-            Arc::new(ParkingMutex::new(None))
-        });
+        let save_path = RECORDING_SAVE_PATH.get_or_init(|| Arc::new(ParkingMutex::new(None)));
         let path_guard = save_path.lock();
         if let Some(base_path) = path_guard.as_ref() {
             setup_recording_directory(&mut state_guard, base_path)?;
@@ -1181,9 +1292,8 @@ async fn stop_recording() -> Result<(), String> {
 
 #[tauri::command]
 async fn start_mic(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     {
         let mut state_guard = state.lock();
@@ -1203,9 +1313,8 @@ async fn start_mic(app_handle: AppHandle, language: Option<String>) -> Result<()
 
 #[tauri::command]
 async fn stop_mic() -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let mut state_guard = state.lock();
     if state_guard.is_muted {
@@ -1227,18 +1336,14 @@ async fn stop_mic() -> Result<(), String> {
 
 #[tauri::command]
 async fn get_mic_status() -> Result<bool, String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let state_guard = state.lock();
     Ok(!state_guard.is_muted)
 }
 
-fn process_vad_chunk_only(
-    vad_state: &mut SileroVadState,
-    chunk: &[f32],
-) -> Result<f32, String> {
+fn process_vad_chunk_only(vad_state: &mut SileroVadState, chunk: &[f32]) -> Result<f32, String> {
     let chunk_i16: Vec<i16> = chunk
         .iter()
         .map(|&sample| (sample * i16::MAX as f32) as i16)
@@ -1301,7 +1406,8 @@ fn push_sample_with_optional_vad(state: &mut RecordingState, sample: f32, app_ha
                                 // ポストバッファ期間中: 音声として追加
                                 state.audio_buffer.extend_from_slice(&chunk);
                                 state.session_audio.extend_from_slice(&chunk);
-                                vad_state.post_buffer_remaining = vad_state.post_buffer_remaining.saturating_sub(chunk.len());
+                                vad_state.post_buffer_remaining =
+                                    vad_state.post_buffer_remaining.saturating_sub(chunk.len());
 
                                 if vad_state.post_buffer_remaining == 0 {
                                     vad_state.is_voice_active = false;
@@ -1310,7 +1416,8 @@ fn push_sample_with_optional_vad(state: &mut RecordingState, sample: f32, app_ha
                                 // プレバッファに保存（最大200ms分）
                                 vad_state.pre_buffer.extend_from_slice(&chunk);
                                 if vad_state.pre_buffer.len() > VAD_PRE_BUFFER_SAMPLES {
-                                    let excess = vad_state.pre_buffer.len() - VAD_PRE_BUFFER_SAMPLES;
+                                    let excess =
+                                        vad_state.pre_buffer.len() - VAD_PRE_BUFFER_SAMPLES;
                                     vad_state.pre_buffer.drain(0..excess);
                                 }
                                 vad_state.is_voice_active = false;
@@ -1340,7 +1447,10 @@ fn push_sample_with_optional_vad(state: &mut RecordingState, sample: f32, app_ha
     // Emit periodic VAD voice activity events every 500ms
     let now = std::time::Instant::now();
     if now.duration_since(state.last_vad_event_time).as_millis() >= 500 {
-        let is_voice_active = state.vad_state.as_ref().map_or(false, |v| v.is_voice_active);
+        let is_voice_active = state
+            .vad_state
+            .as_ref()
+            .map_or(false, |v| v.is_voice_active);
         emit_voice_activity_event(app_handle, "user", is_voice_active);
         state.last_vad_event_time = now;
     }
@@ -1382,13 +1492,17 @@ fn flush_vad_pending(state: &mut RecordingState) {
             Ok(prob) => {
                 if prob >= vad_state.threshold {
                     state.audio_buffer.extend_from_slice(&chunk[..original_len]);
-                    state.session_audio.extend_from_slice(&chunk[..original_len]);
+                    state
+                        .session_audio
+                        .extend_from_slice(&chunk[..original_len]);
                 }
             }
             Err(err) => {
                 eprintln!("Silero VAD failed during flush: {}", err);
                 state.audio_buffer.extend_from_slice(&chunk[..original_len]);
-                state.session_audio.extend_from_slice(&chunk[..original_len]);
+                state
+                    .session_audio
+                    .extend_from_slice(&chunk[..original_len]);
                 disable_vad = true;
             }
         }
@@ -1402,10 +1516,10 @@ fn flush_vad_pending(state: &mut RecordingState) {
 #[tauri::command]
 async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
     let host = cpal::default_host();
-    let default_device_name = host.default_input_device()
-        .and_then(|d| d.name().ok());
+    let default_device_name = host.default_input_device().and_then(|d| d.name().ok());
 
-    let devices: Vec<AudioDevice> = host.input_devices()
+    let devices: Vec<AudioDevice> = host
+        .input_devices()
         .map_err(|e| format!("Failed to enumerate devices: {}", e))?
         .filter_map(|device| {
             device.name().ok().map(|name| {
@@ -1434,24 +1548,26 @@ async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
 
 #[tauri::command]
 async fn select_audio_device(device_name: String) -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let mut state_guard = state.lock();
     state_guard.selected_device_name = Some(device_name.clone());
 
     let now = chrono::Local::now();
-    println!("[{}] Selected audio device: {}", now.format("%H:%M:%S"), device_name);
+    println!(
+        "[{}] Selected audio device: {}",
+        now.format("%H:%M:%S"),
+        device_name
+    );
 
     Ok(())
 }
 
 #[tauri::command]
 async fn get_streaming_config() -> Result<StreamingConfig, String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let state_guard = state.lock();
     Ok(StreamingConfig {
@@ -1463,9 +1579,8 @@ async fn get_streaming_config() -> Result<StreamingConfig, String> {
 
 #[tauri::command]
 async fn set_streaming_config(config: StreamingConfig) -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let mut state_guard = state.lock();
     let clamped_threshold = config.vad_threshold.clamp(0.01, 0.99);
@@ -1533,17 +1648,14 @@ async fn get_system_audio_status() -> Result<bool, String> {
 
 #[tauri::command]
 async fn set_recording_save_config(enabled: bool, path: Option<String>) -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let mut state_guard = state.lock();
     state_guard.recording_save_enabled = enabled;
     drop(state_guard);
 
-    let save_path = RECORDING_SAVE_PATH.get_or_init(|| {
-        Arc::new(ParkingMutex::new(None))
-    });
+    let save_path = RECORDING_SAVE_PATH.get_or_init(|| Arc::new(ParkingMutex::new(None)));
     let mut path_guard = save_path.lock();
     *path_guard = path.clone();
     drop(path_guard);
@@ -1562,17 +1674,14 @@ async fn set_recording_save_config(enabled: bool, path: Option<String>) -> Resul
 
 #[tauri::command]
 async fn get_recording_save_config() -> Result<(bool, Option<String>), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let state_guard = state.lock();
     let enabled = state_guard.recording_save_enabled;
     drop(state_guard);
 
-    let save_path = RECORDING_SAVE_PATH.get_or_init(|| {
-        Arc::new(ParkingMutex::new(None))
-    });
+    let save_path = RECORDING_SAVE_PATH.get_or_init(|| Arc::new(ParkingMutex::new(None)));
     let path_guard = save_path.lock();
     let path = path_guard.clone();
 
@@ -1581,9 +1690,8 @@ async fn get_recording_save_config() -> Result<(bool, Option<String>), String> {
 
 #[tauri::command]
 async fn set_screen_recording_config(enabled: bool) -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let mut state_guard = state.lock();
     state_guard.screen_recording_enabled = enabled;
@@ -1600,9 +1708,8 @@ async fn set_screen_recording_config(enabled: bool) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_screen_recording_config() -> Result<bool, String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let state_guard = state.lock();
     Ok(state_guard.screen_recording_enabled)
@@ -1610,16 +1717,13 @@ async fn get_screen_recording_config() -> Result<bool, String> {
 
 #[tauri::command]
 async fn start_screen_recording() -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let mut state_guard = state.lock();
 
     if state_guard.recording_save_enabled {
-        let save_path = RECORDING_SAVE_PATH.get_or_init(|| {
-            Arc::new(ParkingMutex::new(None))
-        });
+        let save_path = RECORDING_SAVE_PATH.get_or_init(|| Arc::new(ParkingMutex::new(None)));
         let path_guard = save_path.lock();
         if let Some(base_path) = path_guard.as_ref() {
             setup_recording_directory(&mut state_guard, base_path)?;
@@ -1650,9 +1754,8 @@ async fn start_screen_recording() -> Result<(), String> {
 
 #[tauri::command]
 async fn stop_screen_recording() -> Result<(), String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let mut state_guard = state.lock();
     state_guard.screen_recording_active = false;
@@ -1663,9 +1766,8 @@ async fn stop_screen_recording() -> Result<(), String> {
 
 #[tauri::command]
 async fn get_screen_recording_status() -> Result<bool, String> {
-    let state = RECORDING_STATE.get_or_init(|| {
-        Arc::new(ParkingMutex::new(default_recording_state()))
-    });
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
 
     let state_guard = state.lock();
     Ok(state_guard.screen_recording_active)
@@ -1704,8 +1806,7 @@ fn resample_audio(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
         let frac = src_pos - idx as f64;
 
         if idx + 1 < input.len() {
-            let sample = input[idx] as f64 * (1.0 - frac)
-                + input[idx + 1] as f64 * frac;
+            let sample = input[idx] as f64 * (1.0 - frac) + input[idx + 1] as f64 * frac;
             output.push(sample as f32);
         } else if idx < input.len() {
             output.push(input[idx]);
@@ -1737,6 +1838,8 @@ pub fn run() {
             select_audio_device,
             get_streaming_config,
             set_streaming_config,
+            get_whisper_params,
+            set_whisper_params,
             set_recording_save_config,
             get_recording_save_config,
             set_screen_recording_config,
