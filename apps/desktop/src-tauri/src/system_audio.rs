@@ -407,6 +407,24 @@ pub fn stop_system_audio_capture(
     }
 }
 
+pub fn update_language(
+    language: Option<String>,
+) -> Result<(), String> {
+    unsafe {
+        if let Some(state_arc) = &RECORDING_STATE {
+            let mut state_guard = state_arc.lock();
+            state_guard.language = language.clone();
+            drop(state_guard);
+
+            let now = chrono::Local::now();
+            let lang_str = language.as_deref().unwrap_or("auto");
+            println!("[{}] System Language updated to: {}", now.format("%H:%M:%S"), lang_str);
+        }
+    }
+
+    Ok(())
+}
+
 fn save_session_audio_to_wav(
     audio_data: &[f32],
     session_id: u64,

@@ -548,9 +548,20 @@ function App() {
     await loadRemoteModels();
   };
 
-  const handleLanguageChange = (language: string) => {
+  const handleLanguageChange = async (language: string) => {
     setSelectedLanguage(language);
     localStorage.setItem("selectedLanguage", language);
+
+    try {
+      await invoke("update_language", {
+        language: language === "auto" ? null : language,
+      });
+    } catch (err) {
+      console.error("Failed to update language:", err);
+      setError(
+        `言語変更エラー: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   };
 
   const handleInstallModel = async (modelId: string) => {

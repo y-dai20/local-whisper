@@ -1242,7 +1242,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
 }
 
 #[tauri::command]
-async fn start_recording(_app_handle: AppHandle, _language: Option<String>) -> Result<(), String> {
+async fn start_recording(_app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
     let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
 
     let mut state_guard = state.lock();
@@ -1254,6 +1254,7 @@ async fn start_recording(_app_handle: AppHandle, _language: Option<String>) -> R
     println!("[{}] Starting recording session...", now.format("%H:%M:%S"));
 
     state_guard.is_recording = true;
+    state_guard.language = language.clone();
 
     if state_guard.recording_save_enabled {
         let save_path = RECORDING_SAVE_PATH.get_or_init(|| Arc::new(ParkingMutex::new(None)));
@@ -1265,6 +1266,23 @@ async fn start_recording(_app_handle: AppHandle, _language: Option<String>) -> R
 
     let now = chrono::Local::now();
     println!("[{}] Recording session started", now.format("%H:%M:%S"));
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn update_language(language: Option<String>) -> Result<(), String> {
+    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+
+    let mut state_guard = state.lock();
+    state_guard.language = language.clone();
+    drop(state_guard);
+
+    let now = chrono::Local::now();
+    let lang_str = language.as_deref().unwrap_or("auto");
+    println!("[{}] Language updated to: {}", now.format("%H:%M:%S"), lang_str);
+
+    system_audio::update_language(language);
 
     Ok(())
 }
@@ -1827,6 +1845,7 @@ pub fn run() {
             transcribe_audio_stream,
             start_recording,
             stop_recording,
+            update_language,
             start_mic,
             stop_mic,
             get_mic_status,
