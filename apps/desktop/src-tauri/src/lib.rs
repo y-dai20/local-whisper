@@ -1,12 +1,14 @@
-use asr_core::{WhisperContext, WhisperParams};
+use asr_core::{TranscribedSegment, WhisperContext, WhisperParams};
 use chrono;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavSpec, WavWriter};
+use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex as ParkingMutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -57,8 +59,11 @@ static WHISPER_CTX: OnceCell<Arc<Mutex<Option<WhisperContext>>>> = OnceCell::new
 static WHISPER_PARAMS: OnceCell<Arc<ParkingMutex<WhisperParams>>> = OnceCell::new();
 static RECORDING_STATE: OnceCell<Arc<ParkingMutex<RecordingState>>> = OnceCell::new();
 static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCell::new();
+static MANUAL_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const VAD_SAMPLE_RATE: u32 = 16_000;
+const MANUAL_SEGMENT_FINALIZE_DELAY_MS: i64 = 2_000;
+const MANUAL_SEGMENT_MAX_DURATION_MS: i64 = 8_000;
 const VAD_CHUNK_SIZE: usize = 512;
 const DEFAULT_VAD_THRESHOLD: f32 = 0.1;
 const DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES: usize = 4 * VAD_SAMPLE_RATE as usize;
@@ -91,7 +96,6 @@ struct RecordingState {
     last_voice_sample: Option<usize>,
     last_partial_emit_samples: usize,
     session_id_counter: u64,
-    active_session_id: Option<u64>,
     transcription_tx: Option<mpsc::Sender<TranscriptionCommand>>,
     transcription_handle: Option<JoinHandle<()>>,
     language: Option<String>,
@@ -119,7 +123,6 @@ fn default_recording_state() -> RecordingState {
         last_voice_sample: None,
         last_partial_emit_samples: 0,
         session_id_counter: 0,
-        active_session_id: None,
         transcription_tx: None,
         transcription_handle: None,
         language: None,
@@ -201,6 +204,11 @@ pub(crate) fn emit_transcription_segment(
         return Ok(());
     }
 
+    info!(
+        "[emit_transcription_segment] Emitting segment #{}: {} | is_final: {}",
+        session_id, text, is_final
+    );
+
     let segment = TranscriptionSegment {
         text: text.clone(),
         timestamp: std::time::SystemTime::now()
@@ -235,6 +243,23 @@ pub(crate) fn emit_transcription_segment(
         .map_err(|e| e.to_string())
 }
 
+fn slice_audio_segment(audio_data: &[f32], start_ms: i64, end_ms: i64) -> Vec<f32> {
+    if start_ms >= end_ms {
+        return Vec::new();
+    }
+
+    let start_sample = ((start_ms * VAD_SAMPLE_RATE as i64) / 1000)
+        .clamp(0, audio_data.len() as i64) as usize;
+    let end_sample = ((end_ms * VAD_SAMPLE_RATE as i64) / 1000)
+        .clamp(0, audio_data.len() as i64) as usize;
+
+    if start_sample >= end_sample || start_sample >= audio_data.len() {
+        return Vec::new();
+    }
+    audio_data[start_sample..end_sample.min(audio_data.len())].to_vec()
+}
+
+#[derive(Debug)]
 enum TranscriptionCommand {
     Run {
         audio: Vec<f32>,
@@ -243,6 +268,84 @@ enum TranscriptionCommand {
         is_final: bool,
     },
     Stop,
+}
+
+fn split_segments_on_punctuation(segments: &[TranscribedSegment]) -> Vec<PreparedSegment> {
+    const TERMINATORS: &[char] = &[
+        '。', '！', '？', '．', '!', '?', '.', ',', '、'
+    ];
+    const FINALIZE_THRESHOLD_MS: i64 = 1_500;
+
+    let mut prepared = Vec::new();
+    let mut current_text = String::new();
+    let mut current_start: Option<i64> = None;
+    let mut current_end: i64 = 0;
+
+    let last_segment_end_ms = segments.last().map(|s| s.end_ms).unwrap_or(0);
+
+    debug!(
+        "[split_segments] Processing {} segments, last_segment_end_ms={}",
+        segments.len(),
+        last_segment_end_ms
+    );
+    for (seg_idx, segment) in segments.iter().enumerate() {
+        debug!(
+            "[split_segments] segment #{}: {}ms-{}ms, text='{}'",
+            seg_idx, segment.start_ms, segment.end_ms, segment.text
+        );
+
+        if current_start.is_none() {
+            current_start = Some(segment.start_ms);
+        }
+
+        current_text.push_str(&segment.text);
+        current_end = segment.end_ms;
+
+        let has_terminator = segment
+            .text
+            .chars()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .map(|c| TERMINATORS.contains(&c))
+            .unwrap_or(false);
+
+        let is_far_enough_from_end = (last_segment_end_ms - segment.end_ms) >= FINALIZE_THRESHOLD_MS;
+        let should_split = has_terminator && is_far_enough_from_end;
+
+        if should_split {
+            let text = current_text.clone();
+            let has_content = text.chars().any(|c| !c.is_whitespace());
+            debug!(
+                "[split_segments]   segment #{} triggers split (end_ms={}, last_end_ms={}, diff={}ms), accumulated text='{}'",
+                seg_idx, segment.end_ms, last_segment_end_ms, last_segment_end_ms - segment.end_ms,
+                text.replace('\n', " ")
+            );
+            if has_content {
+                prepared.push(PreparedSegment {
+                    text,
+                    start_ms: current_start.unwrap_or(segment.start_ms),
+                    end_ms: current_end,
+                });
+            }
+            current_text.clear();
+            current_start = None;
+        }
+    }
+
+    if current_text.chars().any(|c| !c.is_whitespace()) {
+        debug!(
+            "[split_segments]   final accumulated text='{}'",
+            current_text.replace('\n', " ")
+        );
+        prepared.push(PreparedSegment {
+            text: current_text.clone(),
+            start_ms: current_start.unwrap_or(0),
+            end_ms: current_end,
+        });
+    }
+
+    debug!("[split_segments] Result: {} prepared segments", prepared.len());
+    prepared
 }
 
 fn spawn_transcription_worker(
@@ -301,7 +404,6 @@ fn spawn_transcription_worker(
                         if let Err(err) = transcribe_and_emit(
                             &audio,
                             language.clone(),
-                            session_id.clone(),
                             is_final,
                             &app_handle,
                         ) {
@@ -314,7 +416,6 @@ fn spawn_transcription_worker(
                         if let Err(err) = transcribe_and_emit(
                             &audio,
                             language.clone(),
-                            session_id,
                             is_final,
                             &app_handle,
                         ) {
@@ -332,10 +433,17 @@ fn spawn_transcription_worker(
 fn transcribe_and_emit(
     audio_data: &[f32],
     language: Option<String>,
-    session_id: String,
     is_final: bool,
     app_handle: &AppHandle,
 ) -> Result<(), String> {
+    let state = RECORDING_STATE
+        .get()
+        .ok_or_else(|| "Recording state not initialized".to_string())?;
+
+    let session_id = {
+        let state_guard = state.lock();
+        format!("mic_{}", state_guard.session_id_counter)
+    };
     let ctx_lock = WHISPER_CTX
         .get()
         .ok_or_else(|| "Whisper not initialized".to_string())?
@@ -346,21 +454,88 @@ fn transcribe_and_emit(
         .ok_or_else(|| "Whisper context not available".to_string())?;
 
     let lang = language.as_deref().unwrap_or("ja");
-    let text = ctx
-        .transcribe_with_language(audio_data, lang)
+
+    if is_final {
+        let text = ctx
+            .transcribe_with_language(audio_data, lang)
+            .map_err(|e| e.to_string())?;
+
+        let mut state_guard = state.lock();
+        state_guard.session_id_counter += 1;
+        let current_session_id = format!("mic_{}", state_guard.session_id_counter);
+        debug!("[transcribe_and_emit] Rotated session_id to: {}", current_session_id);
+        drop(state_guard);
+
+        return emit_transcription_segment(
+            app_handle,
+            text,
+            Some(audio_data.to_vec()),
+            session_id,
+            is_final,
+            "user".to_string(),
+        );
+    }
+
+    let segments = ctx
+        .transcribe_segments_with_language(audio_data, lang)
         .map_err(|e| e.to_string())?;
-    emit_transcription_segment(
-        app_handle,
-        text,
-        if is_final {
-            Some(audio_data.to_vec())
-        } else {
-            None
-        },
-        session_id,
-        is_final,
-        "user".to_string(),
-    )
+
+    let prepared_segments = split_segments_on_punctuation(&segments);
+    info!(
+        "[transcribe_and_emit] Got {} prepared segments from {} segments",
+        prepared_segments.len(),
+        segments.len()
+    );
+
+    let mut finalized_cutoff_ms: Option<i64> = None;
+    let total_segments = prepared_segments.len();
+    let mut current_session_id = session_id.clone();
+
+    for (idx, segment) in prepared_segments.iter().enumerate() {
+        debug!(
+            "[transcribe_and_emit] Emitting segment #{}: {}ms - {}ms, text=\"{}\"",
+            idx,
+            segment.start_ms,
+            segment.end_ms,
+            segment.text.replace('\n', " ")
+        );
+        let segment_audio = slice_audio_segment(audio_data, segment.start_ms, segment.end_ms);
+        let segment_is_final = total_segments > 0 && idx + 1 != total_segments;
+
+        if let Err(err) = emit_transcription_segment(
+            app_handle,
+            segment.text.clone(),
+            if segment_audio.is_empty() {
+                None
+            } else {
+                Some(segment_audio)
+            },
+            current_session_id.clone(),
+            segment_is_final,
+            "user".to_string(),
+        ) {
+            error!("Failed to emit transcription segment: {}", err);
+        }
+
+        if segment_is_final {
+            finalized_cutoff_ms = Some(finalized_cutoff_ms.map_or(segment.end_ms, |cutoff| cutoff.max(segment.end_ms)));
+
+            let mut state_guard = state.lock();
+            state_guard.session_id_counter += 1;
+            current_session_id = format!("mic_{}", state_guard.session_id_counter);
+            debug!("[transcribe_and_emit] Rotated session_id to: {}", current_session_id);
+        }
+    }
+
+    if let Some(cutoff_ms) = finalized_cutoff_ms {
+        let cutoff_samples = ((cutoff_ms.max(0) * VAD_SAMPLE_RATE as i64) / 1000) as usize;
+        let cutoff_samples = cutoff_samples.min(audio_data.len());
+        if cutoff_samples > 0 && session_id.starts_with("mic_") {
+            trim_mic_session_audio_samples(cutoff_samples);
+        }
+    }
+
+    Ok(())
 }
 
 fn save_transcription_to_txt(
@@ -375,9 +550,8 @@ fn save_transcription_to_txt(
     let txt_path = std::path::Path::new(recording_dir).join("transcription.txt");
 
     let timestamp = chrono::Local::now().format("%H:%M:%S");
-    println!(
-        "[{}] Saving transcription to: {} (source: {}, session: {})",
-        timestamp,
+    info!(
+        "Saving transcription to: {} (source: {}, session: {})",
         txt_path.display(),
         source,
         session_id,
@@ -394,7 +568,7 @@ fn save_transcription_to_txt(
     file.write_all(line.as_bytes())
         .map_err(|e| format!("Failed to write transcription: {}", e))?;
 
-    println!("[{}] Successfully wrote transcription to file", timestamp);
+    info!("Successfully wrote transcription to file");
 
     Ok(())
 }
@@ -413,46 +587,24 @@ fn setup_recording_directory(state: &mut RecordingState, base_path: &str) -> Res
     }
 
     state.current_recording_dir = Some(recording_dir.to_string_lossy().to_string());
-    println!(
-        "[{}] Recording directory: {}",
-        now.format("%H:%M:%S"),
+    info!(
+        "Recording directory prepared: {}",
         recording_dir.display()
     );
 
     Ok(())
 }
 
-fn ensure_active_session(state: &mut RecordingState) {
-    if state.active_session_id.is_some() {
-        return;
-    }
-    state.session_id_counter = state.session_id_counter.wrapping_add(1);
-    state.active_session_id = Some(state.session_id_counter);
-    state.session_audio.clear();
-    state.session_samples = 0;
-    state.last_partial_emit_samples = 0;
-    state.last_voice_sample = None;
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Starting session #{}",
-        now.format("%H:%M:%S"),
-        state.session_id_counter
-    );
-}
-
 fn queue_transcription(state: &RecordingState, is_final: bool) {
     if state.session_audio.is_empty() {
         return;
     }
-    let Some(session_id) = state.active_session_id else {
-        return;
-    };
     let Some(tx) = &state.transcription_tx else {
         return;
     };
     let audio = state.session_audio.clone();
     let language = state.language.clone();
-    let session_id_str = format!("mic_{}", session_id);
+    let session_id_str = format!("mic_{}", state.session_id_counter);
     if tx
         .send(TranscriptionCommand::Run {
             audio,
@@ -462,8 +614,46 @@ fn queue_transcription(state: &RecordingState, is_final: bool) {
         })
         .is_err()
     {
-        eprintln!("Failed to send transcription command");
+        error!("Failed to send transcription command");
     }
+}
+
+fn trim_mic_session_audio_samples(cutoff_samples: usize) {
+    if cutoff_samples == 0 {
+        return;
+    }
+
+    let state =
+        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+    let mut state_guard = state.lock();
+    if state_guard.session_audio.is_empty() {
+        return;
+    }
+
+    let trim = cutoff_samples.min(state_guard.session_audio.len());
+    if trim == 0 {
+        return;
+    }
+
+    state_guard.session_audio.drain(0..trim);
+    if trim >= state_guard.audio_buffer.len() {
+        state_guard.audio_buffer.clear();
+    } else {
+        state_guard.audio_buffer.drain(0..trim);
+    }
+
+    state_guard.session_samples = state_guard.session_samples.saturating_sub(trim);
+    state_guard.last_partial_emit_samples =
+        state_guard.last_partial_emit_samples.saturating_sub(trim);
+    if let Some(last_voice) = state_guard.last_voice_sample {
+        state_guard.last_voice_sample = last_voice.checked_sub(trim);
+    }
+
+    println!(
+        "[trim_mic_session_audio_samples] Trimmed {} samples, remaining session_audio: {} samples",
+        trim,
+        state_guard.session_audio.len()
+    );
 }
 
 fn save_mic_session_audio_to_wav(
@@ -541,8 +731,7 @@ fn save_mic_session_audio_to_wav(
 }
 
 fn finalize_active_session(state: &mut RecordingState, reason: &str) {
-    if state.active_session_id.is_none() || state.session_audio.is_empty() {
-        state.active_session_id = None;
+    if state.session_audio.is_empty() {
         state.session_audio.clear();
         state.session_samples = 0;
         state.last_partial_emit_samples = 0;
@@ -554,7 +743,7 @@ fn finalize_active_session(state: &mut RecordingState, reason: &str) {
     println!(
         "[{}] Finalizing session #{} ({})",
         now.format("%H:%M:%S"),
-        state.active_session_id.unwrap(),
+        state.session_id_counter,
         reason,
     );
     queue_transcription(state, true);
@@ -563,7 +752,7 @@ fn finalize_active_session(state: &mut RecordingState, reason: &str) {
     if state.recording_save_enabled && state.is_recording {
         if let Some(recording_dir) = &state.current_recording_dir {
             let audio_clone = state.session_audio.clone();
-            let session_id = state.active_session_id.unwrap();
+            let session_id = state.session_id_counter;
             let audio_len = audio_clone.len();
             let duration = audio_len as f32 / 16000.0;
             let dir = recording_dir.clone();
@@ -592,7 +781,6 @@ fn finalize_active_session(state: &mut RecordingState, reason: &str) {
         }
     }
 
-    state.active_session_id = None;
     state.session_audio.clear();
     state.session_samples = 0;
     state.last_partial_emit_samples = 0;
@@ -608,11 +796,18 @@ fn stop_transcription_worker(state: &mut RecordingState) {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct TranscriptionResult {
     success: bool,
-    text: Option<String>,
+    segments: Option<Vec<PreparedSegment>>,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PreparedSegment {
+    text: String,
+    start_ms: i64,
+    end_ms: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -895,7 +1090,6 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         state_guard.session_samples = 0;
         state_guard.last_voice_sample = None;
         state_guard.last_partial_emit_samples = 0;
-        state_guard.active_session_id = None;
         state_guard.sample_rate = VAD_SAMPLE_RATE;
 
         let now = chrono::Local::now();
@@ -1022,7 +1216,6 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mut state = state_clone.lock();
                     if !state.is_muted && state.mic_stream_id == current_mic_stream_id {
-                        ensure_active_session(&mut state);
                         let mono_samples: Vec<f32> = data.iter().step_by(channels).copied().collect();
                         let processed_samples = if device_sample_rate == VAD_SAMPLE_RATE {
                             mono_samples
@@ -1035,7 +1228,6 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
 
                         if state.session_samples >= SESSION_MAX_SAMPLES {
                             finalize_active_session(&mut state, "session_max_duration");
-                            ensure_active_session(&mut state);
                         }
                         let chunk_max = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                         if chunk_max == 0.0 {
@@ -1088,7 +1280,6 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let mut state = state_clone.lock();
                     if !state.is_muted && state.mic_stream_id == current_mic_stream_id {
-                        ensure_active_session(&mut state);
                         let mono_samples: Vec<f32> = data
                             .iter()
                             .step_by(channels)
@@ -1105,7 +1296,6 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
 
                         if state.session_samples >= SESSION_MAX_SAMPLES {
                             finalize_active_session(&mut state, "session_max_duration");
-                            ensure_active_session(&mut state);
                         }
                         let mut count = callback_count.lock();
                         *count += 1;
@@ -1407,7 +1597,6 @@ fn push_sample_with_optional_vad(state: &mut RecordingState, sample: f32, app_ha
     if let Some(last_voice) = state.last_voice_sample {
         if state.session_samples - last_voice >= SILENCE_TIMEOUT_SAMPLES {
             finalize_active_session(state, "silence_timeout");
-            ensure_active_session(state);
         }
     }
 

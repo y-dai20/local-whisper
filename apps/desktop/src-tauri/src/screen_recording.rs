@@ -1,3 +1,4 @@
+use log::info;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
@@ -13,13 +14,8 @@ pub fn start_screen_recording(output_path: &str) -> Result<(), String> {
     unsafe {
         let result = screen_recording_start(c_path.as_ptr());
 
-        let now = chrono::Local::now();
         if result == 0 {
-            println!(
-                "[{}] Screen recording started: {}",
-                now.format("%H:%M:%S"),
-                output_path
-            );
+            info!("Screen recording started: {}", output_path);
             Ok(())
         } else if result == -2 {
             Err("Screen recording requires macOS 13.0+".to_string())
@@ -32,9 +28,7 @@ pub fn start_screen_recording(output_path: &str) -> Result<(), String> {
 pub fn stop_screen_recording() -> Result<(), String> {
     unsafe {
         let result = screen_recording_stop();
-
-        let now = chrono::Local::now();
-        println!("[{}] Screen recording stopped", now.format("%H:%M:%S"));
+        info!("Screen recording stopped");
 
         if result == 0 {
             Ok(())

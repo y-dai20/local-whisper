@@ -44,6 +44,21 @@ pub struct WhisperContext {
     params: WhisperParams,
 }
 
+#[derive(Debug, Clone)]
+pub struct TranscribedSegment {
+    pub text: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub words: Vec<TranscribedWord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscribedWord {
+    pub text: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
 impl WhisperContext {
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self, WhisperError> {
         let mut ctx_params = WhisperContextParameters::default();
@@ -76,114 +91,114 @@ impl WhisperContext {
         self.params
     }
 
+    pub fn transcribe_segments_with_language(
+        &self,
+        audio_data: &[f32],
+        language: &str,
+    ) -> Result<Vec<TranscribedSegment>, WhisperError> {
+        let mut state = self
+            .ctx
+            .create_state()
+            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_print_progress(false);
+        params.set_print_special(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_translate(false);
+        params.set_language(Some(language));
+        params.set_n_threads(num_cpus());
+        params.set_single_segment(false);
+        params.set_audio_ctx(self.params.audio_ctx);
+        params.set_temperature(self.params.temperature);
+        params.set_token_timestamps(true);
+        params.set_thold_pt(0.01);
+        params.set_thold_ptsum(0.01);
+        params.set_max_len(1);
+        params.set_split_on_word(true);
+
+        let inference_start = Instant::now();
+        state
+            .full(params, audio_data)
+            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+        let inference_elapsed = inference_start.elapsed();
+
+        let num_segments = state
+            .full_n_segments()
+            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+
+        let mut segments = Vec::with_capacity(num_segments as usize);
+        for i in 0..num_segments {
+            let text = state
+                .full_get_segment_text_lossy(i)
+                .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+            let start_cs = state
+                .full_get_segment_t0(i)
+                .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+            let end_cs = state
+                .full_get_segment_t1(i)
+                .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+            let words = collect_words(&state, i)?;
+            segments.push(TranscribedSegment {
+                text,
+                start_ms: start_cs * 10,
+                end_ms: end_cs * 10,
+                words,
+            });
+        }
+
+        Ok(segments)
+    }
+
     pub fn transcribe_with_language(
         &self,
         audio_data: &[f32],
         language: &str,
     ) -> Result<String, WhisperError> {
-        let mut state = self
-            .ctx
-            .create_state()
-            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
-
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_print_progress(false);
-        params.set_print_special(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        params.set_translate(false);
-        params.set_language(Some(language));
-        params.set_n_threads(num_cpus());
-        params.set_single_segment(false);
-        params.set_audio_ctx(self.params.audio_ctx);
-        params.set_temperature(self.params.temperature);
-
-        let inference_start = Instant::now();
-        state
-            .full(params, audio_data)
-            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
-        let inference_elapsed = inference_start.elapsed();
-        println!(
-            "[Whisper] Inference (streaming) completed in {:.2?} for {} samples",
-            inference_elapsed,
-            audio_data.len()
-        );
-
-        let num_segments = state
-            .full_n_segments()
-            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
-
+        let segments = self.transcribe_segments_with_language(audio_data, language)?;
         let mut full_text = String::new();
-        for i in 0..num_segments {
-            let segment = state
-                .full_get_segment_text(i)
-                .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
-            full_text.push_str(&segment);
+        for segment in segments {
+            full_text.push_str(&segment.text);
         }
-
         Ok(full_text)
     }
+}
 
-    pub fn transcribe_with_callback<F>(
-        &self,
-        audio_data: &[f32],
-        callback: F,
-    ) -> Result<(), WhisperError>
-    where
-        F: FnMut(&str),
-    {
-        self.transcribe_with_callback_and_language(audio_data, "ja", callback)
-    }
+fn collect_words(
+    state: &whisper_rs::WhisperState,
+    segment_index: i32,
+) -> Result<Vec<TranscribedWord>, WhisperError> {
+    let token_count = state
+        .full_n_tokens(segment_index)
+        .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
 
-    pub fn transcribe_with_callback_and_language<F>(
-        &self,
-        audio_data: &[f32],
-        language: &str,
-        mut callback: F,
-    ) -> Result<(), WhisperError>
-    where
-        F: FnMut(&str),
-    {
-        let mut state = self
-            .ctx
-            .create_state()
+    let mut words = Vec::with_capacity(token_count as usize);
+    for token_idx in 0..token_count {
+        let token_text = state
+            .full_get_token_text_lossy(segment_index, token_idx)
+            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
+        let token_data = state
+            .full_get_token_data(segment_index, token_idx)
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_print_progress(false);
-        params.set_print_special(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        params.set_translate(false);
-        params.set_language(Some(language));
-        params.set_n_threads(num_cpus());
-        params.set_single_segment(false);
-        params.set_audio_ctx(self.params.audio_ctx);
-        params.set_temperature(self.params.temperature);
-
-        let inference_start = Instant::now();
-        state
-            .full(params, audio_data)
-            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
-        let inference_elapsed = inference_start.elapsed();
-        println!(
-            "[Whisper] Inference (streaming) completed in {:.2?} for {} samples",
-            inference_elapsed,
-            audio_data.len()
-        );
-
-        let num_segments = state
-            .full_n_segments()
-            .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
-
-        for i in 0..num_segments {
-            if let Ok(segment) = state.full_get_segment_text(i) {
-                callback(&segment);
-            }
+        if token_data.t0 < 0 || token_data.t1 <= token_data.t0 {
+            continue;
         }
 
-        Ok(())
+        let trimmed = token_text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        words.push(TranscribedWord {
+            text: trimmed.to_string(),
+            start_ms: token_data.t0 * 10,
+            end_ms: token_data.t1 * 10,
+        });
     }
+
+    Ok(words)
 }
 
 fn num_cpus() -> i32 {

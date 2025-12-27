@@ -22,7 +22,6 @@ struct SystemAudioSession {
     last_voice_sample: Option<usize>,
     last_partial_emit_samples: usize,
     session_id_counter: u64,
-    active_session_id: Option<u64>,
     partial_transcript_interval_samples: usize,
     last_vad_event_time: std::time::Instant,
     is_voice_active: bool,
@@ -110,11 +109,10 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
 }
 
 fn ensure_system_audio_session(session: &mut SystemAudioSession) {
-    if session.active_session_id.is_some() {
+    if session.session_id_counter > 0 && !session.session_audio.is_empty() {
         return;
     }
     session.session_id_counter = session.session_id_counter.wrapping_add(1);
-    session.active_session_id = Some(session.session_id_counter);
     session.session_audio.clear();
     session.session_samples = 0;
     session.last_partial_emit_samples = 0;
@@ -195,9 +193,9 @@ fn queue_system_audio_transcription(
     if session.session_audio.is_empty() {
         return;
     }
-    let Some(session_id) = session.active_session_id else {
+    if session.session_id_counter == 0 {
         return;
-    };
+    }
     let Some(app) = app_handle else {
         return;
     };
@@ -205,6 +203,7 @@ fn queue_system_audio_transcription(
     let audio = session.session_audio.clone();
     let lang = language.unwrap_or("ja").to_string();
     let app_clone = app.clone();
+    let session_id = session.session_id_counter;
 
     std::thread::spawn(move || {
         if let Err(e) = transcribe_system_audio(&audio, &lang, session_id, is_final, &app_clone) {
@@ -219,8 +218,7 @@ fn finalize_system_audio_session(
     app_handle: Option<&AppHandle>,
     language: Option<&str>,
 ) {
-    if session.active_session_id.is_none() || session.session_audio.is_empty() {
-        session.active_session_id = None;
+    if session.session_id_counter == 0 || session.session_audio.is_empty() {
         session.session_audio.clear();
         session.session_samples = 0;
         session.last_partial_emit_samples = 0;
@@ -232,7 +230,7 @@ fn finalize_system_audio_session(
     println!(
         "[{}] Finalizing SystemAudio session #{} ({})",
         now.format("%H:%M:%S"),
-        session.active_session_id.unwrap(),
+        session.session_id_counter,
         reason,
     );
 
@@ -250,7 +248,7 @@ fn finalize_system_audio_session(
             if save_enabled && is_recording {
                 if let Some(dir) = recording_dir {
                     let audio_clone = session.session_audio.clone();
-                    let session_id = session.active_session_id.unwrap();
+                    let session_id = session.session_id_counter;
                     let audio_len = audio_clone.len();
                     let duration = audio_len as f32 / 16000.0;
 
@@ -280,7 +278,6 @@ fn finalize_system_audio_session(
         }
     }
 
-    session.active_session_id = None;
     session.session_audio.clear();
     session.session_samples = 0;
     session.last_partial_emit_samples = 0;
@@ -355,7 +352,6 @@ pub fn start_system_audio_capture(
             last_voice_sample: None,
             last_partial_emit_samples: 0,
             session_id_counter: 0,
-            active_session_id: None,
             partial_transcript_interval_samples: partial_interval,
             last_vad_event_time: std::time::Instant::now(),
             is_voice_active: false,
