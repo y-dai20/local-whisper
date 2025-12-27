@@ -75,10 +75,13 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
         let log_count = SAMPLE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
         if log_count < 5 {
             let preview: Vec<String> = slice.iter().take(10).map(|v| format!("{:.6}", v)).collect();
-            let timestamp = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "[{}] System audio sample details: count={}, max={:.6}, non_zero={}/{}, preview=[{}]",
-                timestamp, count, max_sample, non_zero_count, count, preview.join(" ")
+            info!(
+                "System audio sample details: count={}, max={:.6}, non_zero={}/{}, preview=[{}]",
+                count,
+                max_sample,
+                non_zero_count,
+                count,
+                preview.join(" ")
             );
         }
 
@@ -98,10 +101,11 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
 
         if should_log {
             let total_seconds = total_samples as f32 / 16000.0;
-            let timestamp = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "[{}] System audio: received {} samples (total {:.2}s, RMS {:.4})",
-                timestamp, count, total_seconds, rms
+            info!(
+                "System audio: received {} samples (total {:.2}s, RMS {:.4})",
+                count,
+                total_seconds,
+                rms
             );
             *last_log = Some(now);
         }
@@ -117,12 +121,7 @@ fn ensure_system_audio_session(session: &mut SystemAudioSession) {
     session.session_samples = 0;
     session.last_partial_emit_samples = 0;
     session.last_voice_sample = None;
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Starting SystemAudio session #{}",
-        now.format("%H:%M:%S"),
-        session.session_id_counter
-    );
+    info!("Starting SystemAudio session #{}", session.session_id_counter);
 }
 
 fn process_system_audio_sample(
@@ -207,7 +206,7 @@ fn queue_system_audio_transcription(
 
     std::thread::spawn(move || {
         if let Err(e) = transcribe_system_audio(&audio, &lang, session_id, is_final, &app_clone) {
-            eprintln!("System audio transcription error: {}", e);
+            error!("System audio transcription error: {}", e);
         }
     });
 }
@@ -226,10 +225,8 @@ fn finalize_system_audio_session(
         return;
     }
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Finalizing SystemAudio session #{} ({})",
-        now.format("%H:%M:%S"),
+    info!(
+        "Finalizing SystemAudio session #{} ({})",
         session.session_id_counter,
         reason,
     );
@@ -252,10 +249,8 @@ fn finalize_system_audio_session(
                     let audio_len = audio_clone.len();
                     let duration = audio_len as f32 / 16000.0;
 
-                    let now = chrono::Local::now();
-                    println!(
-                        "[{}] Saving system audio session #{}: {} samples ({:.2}s) to {}",
-                        now.format("%H:%M:%S"),
+                    info!(
+                        "Saving system audio session #{}: {} samples ({:.2}s) to {}",
                         session_id,
                         audio_len,
                         duration,
@@ -264,15 +259,11 @@ fn finalize_system_audio_session(
 
                     std::thread::spawn(move || {
                         if let Err(e) = save_session_audio_to_wav(&audio_clone, session_id, &dir) {
-                            eprintln!("Failed to save system audio session: {}", e);
+                            error!("Failed to save system audio session: {}", e);
                         }
                     });
                 } else {
-                    let now = chrono::Local::now();
-                    println!(
-                        "[{}] Recording save enabled but no recording directory set",
-                        now.format("%H:%M:%S")
-                    );
+                    info!("Recording save enabled but no recording directory set");
                 }
             }
         }
@@ -367,8 +358,7 @@ pub fn start_system_audio_capture(
             let mut state_guard = state.lock();
             state_guard.system_audio_enabled = true;
 
-            let now = chrono::Local::now();
-            println!("[{}] System audio capture started", now.format("%H:%M:%S"));
+            info!("System audio capture started");
 
             Ok(())
         } else if result == -2 {
@@ -392,8 +382,7 @@ pub fn stop_system_audio_capture(
         APP_HANDLE = None;
         RECORDING_STATE = None;
 
-        let now = chrono::Local::now();
-        println!("[{}] System audio capture stopped", now.format("%H:%M:%S"));
+        info!("System audio capture stopped");
 
         if result == 0 {
             Ok(())
@@ -412,9 +401,8 @@ pub fn update_language(
             state_guard.language = language.clone();
             drop(state_guard);
 
-            let now = chrono::Local::now();
             let lang_str = language.as_deref().unwrap_or("auto");
-            println!("[{}] System Language updated to: {}", now.format("%H:%M:%S"), lang_str);
+            info!("System Language updated to: {}", lang_str);
         }
     }
 
@@ -433,17 +421,14 @@ fn save_session_audio_to_wav(
 
     let mut path = PathBuf::from(recording_dir);
 
-    println!(
-        "[{}] Saving system audio to recording directory: {}",
-        now.format("%H:%M:%S"),
+    info!(
+        "Saving system audio to recording directory: {}",
         path.display()
     );
 
     if !path.exists() {
-        let now = chrono::Local::now();
-        println!(
-            "[{}] Creating directory: {}",
-            now.format("%H:%M:%S"),
+        info!(
+            "Creating directory: {}",
             path.display()
         );
         std::fs::create_dir_all(&path).map_err(|e| format!("Failed to create directory: {}", e))?;
@@ -458,10 +443,8 @@ fn save_session_audio_to_wav(
         sample_format: hound::SampleFormat::Int,
     };
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Creating WAV file: {}",
-        now.format("%H:%M:%S"),
+    info!(
+        "Creating WAV file: {}",
         path.display()
     );
 
@@ -482,10 +465,8 @@ fn save_session_audio_to_wav(
     let elapsed = start_time.elapsed();
     let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Successfully saved system audio session #{} to: {} ({} bytes, took {:.2}ms)",
-        now.format("%H:%M:%S"),
+    info!(
+        "Successfully saved system audio session #{} to: {} ({} bytes, took {:.2}ms)",
         session_id,
         path.display(),
         file_size,

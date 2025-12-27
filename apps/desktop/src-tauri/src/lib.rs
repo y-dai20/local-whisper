@@ -407,7 +407,7 @@ fn spawn_transcription_worker(
                             is_final,
                             &app_handle,
                         ) {
-                            eprintln!("Transcription worker error: {}", err);
+                            error!("Transcription worker error: {}", err);
                         }
                     }
 
@@ -419,7 +419,7 @@ fn spawn_transcription_worker(
                             is_final,
                             &app_handle,
                         ) {
-                            eprintln!("Transcription worker error: {}", err);
+                            error!("Transcription worker error: {}", err);
                         }
                     }
                 }
@@ -649,7 +649,7 @@ fn trim_mic_session_audio_samples(cutoff_samples: usize) {
         state_guard.last_voice_sample = last_voice.checked_sub(trim);
     }
 
-    println!(
+    debug!(
         "[trim_mic_session_audio_samples] Trimmed {} samples, remaining session_audio: {} samples",
         trim,
         state_guard.session_audio.len()
@@ -668,19 +668,10 @@ fn save_mic_session_audio_to_wav(
 
     let mut path = PathBuf::from(recording_dir);
 
-    println!(
-        "[{}] Saving mic audio to recording directory: {}",
-        now.format("%H:%M:%S"),
-        path.display()
-    );
+    info!("Saving mic audio to recording directory: {}", path.display());
 
     if !path.exists() {
-        let now = chrono::Local::now();
-        println!(
-            "[{}] Creating directory: {}",
-            now.format("%H:%M:%S"),
-            path.display()
-        );
+        debug!("Creating directory: {}", path.display());
         std::fs::create_dir_all(&path).map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
@@ -693,12 +684,7 @@ fn save_mic_session_audio_to_wav(
         sample_format: hound::SampleFormat::Int,
     };
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Creating WAV file: {}",
-        now.format("%H:%M:%S"),
-        path.display()
-    );
+    debug!("Creating WAV file: {}", path.display());
 
     let mut writer =
         WavWriter::create(&path, spec).map_err(|e| format!("Failed to create WAV file: {}", e))?;
@@ -717,10 +703,8 @@ fn save_mic_session_audio_to_wav(
     let elapsed = start_time.elapsed();
     let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Successfully saved microphone audio session #{} to: {} ({} bytes, took {:.2}ms)",
-        now.format("%H:%M:%S"),
+    info!(
+        "Successfully saved microphone audio session #{} to: {} ({} bytes, took {:.2}ms)",
         session_id,
         path.display(),
         file_size,
@@ -739,10 +723,8 @@ fn finalize_active_session(state: &mut RecordingState, reason: &str) {
         return;
     }
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Finalizing session #{} ({})",
-        now.format("%H:%M:%S"),
+    info!(
+        "Finalizing session #{} ({})",
         state.session_id_counter,
         reason,
     );
@@ -757,10 +739,8 @@ fn finalize_active_session(state: &mut RecordingState, reason: &str) {
             let duration = audio_len as f32 / 16000.0;
             let dir = recording_dir.clone();
 
-            let now = chrono::Local::now();
-            println!(
-                "[{}] Saving microphone audio session #{}: {} samples ({:.2}s) to {}",
-                now.format("%H:%M:%S"),
+            info!(
+                "Saving microphone audio session #{}: {} samples ({:.2}s) to {}",
                 session_id,
                 audio_len,
                 duration,
@@ -769,15 +749,11 @@ fn finalize_active_session(state: &mut RecordingState, reason: &str) {
 
             std::thread::spawn(move || {
                 if let Err(e) = save_mic_session_audio_to_wav(&audio_clone, session_id, &dir) {
-                    eprintln!("Failed to save microphone audio session: {}", e);
+                    error!("Failed to save microphone audio session: {}", e);
                 }
             });
         } else {
-            let now = chrono::Local::now();
-            println!(
-                "[{}] Microphone audio save enabled but no recording directory set",
-                now.format("%H:%M:%S")
-            );
+            debug!("Microphone audio save enabled but no recording directory set");
         }
     }
 
@@ -939,10 +915,8 @@ async fn set_whisper_params(config: WhisperParamsConfig) -> Result<(), String> {
         }
     }
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Updated Whisper params: audio_ctx {}, temperature {:.2}",
-        now.format("%H:%M:%S"),
+    info!(
+        "Updated Whisper params: audio_ctx {}, temperature {:.2}",
         params.audio_ctx,
         params.temperature
     );
@@ -1092,12 +1066,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         state_guard.last_partial_emit_samples = 0;
         state_guard.sample_rate = VAD_SAMPLE_RATE;
 
-        let now = chrono::Local::now();
-        println!(
-            "[{}] Starting mic stream #{}",
-            now.format("%H:%M:%S"),
-            current_mic_stream_id
-        );
+        info!("Starting mic stream #{}", current_mic_stream_id);
 
         (
             selected_device_name,
@@ -1110,12 +1079,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
 
     // Use selected device or default
     let device = if let Some(device_name) = &selected_device_name {
-        let now = chrono::Local::now();
-        println!(
-            "[{}] Looking for device: {}",
-            now.format("%H:%M:%S"),
-            device_name
-        );
+        info!("Looking for device: {}", device_name);
 
         host.input_devices()
             .map_err(|e| format!("Failed to enumerate devices: {}", e))?
@@ -1134,10 +1098,8 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     let device_name = device
         .name()
         .unwrap_or_else(|_| "Unknown device".to_string());
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Using input device: {}{}",
-        now.format("%H:%M:%S"),
+    info!(
+        "Using input device: {}{}",
         device_name,
         selected_device_name
             .as_ref()
@@ -1151,10 +1113,8 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     let device_sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Recording config - Device sample rate: {}, Channels: {}, Format: {:?}",
-        now.format("%H:%M:%S"),
+    info!(
+        "Recording config - Device sample rate: {}, Channels: {}, Format: {:?}",
         device_sample_rate,
         channels,
         config.sample_format()
@@ -1166,11 +1126,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         .build()
     {
         Ok(vad) => {
-            let now = chrono::Local::now();
-            println!(
-                "[{}] Voice Activity Detector initialized",
-                now.format("%H:%M:%S")
-            );
+            info!("Voice Activity Detector initialized");
             Some(SileroVadState {
                 vad,
                 pending: Vec::new(),
@@ -1181,10 +1137,8 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
             })
         }
         Err(err) => {
-            let now = chrono::Local::now();
-            println!(
-                "[{}] Failed to initialize VAD: {err:?}. Falling back to raw audio.",
-                now.format("%H:%M:%S"),
+            info!(
+                "Failed to initialize VAD: {err:?}. Falling back to raw audio.",
             );
             None
         }
@@ -1195,12 +1149,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         state_guard.vad_state = vad_state;
     }
 
-    let now = chrono::Local::now();
-    println!(
-        "[{}] Building audio stream for format {:?}",
-        now.format("%H:%M:%S"),
-        config.sample_format()
-    );
+    info!("Building audio stream for format {:?}", config.sample_format());
 
     // Build stream with recording ID check to prevent old callbacks from writing
     let stream = match config.sample_format() {
@@ -1234,10 +1183,8 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                             let mut zero_count = zero_chunk_count.lock();
                             *zero_count += 1;
                             if *zero_count <= 5 {
-                                let now = chrono::Local::now();
-                                println!(
-                                    "[{}] Audio callback chunk all zeros (count #{}, {} samples)",
-                                    now.format("%H:%M:%S"),
+                                info!(
+                                    "Audio callback chunk all zeros (count #{}, {} samples)",
                                     *zero_count,
                                     data.len()
                                 );
@@ -1246,11 +1193,9 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                             let mut logged_non_zero_guard = logged_non_zero.lock();
                             if !*logged_non_zero_guard {
                                 *logged_non_zero_guard = true;
-                                let now = chrono::Local::now();
                                 let preview: Vec<String> = data.iter().take(10).map(|v| format!("{:.4}", v)).collect();
-                                println!(
-                                    "[{}] First non-zero chunk detected: max {:.4}, preview [{}]",
-                                    now.format("%H:%M:%S"),
+                                info!(
+                                    "First non-zero chunk detected: max {:.4}, preview [{}]",
                                     chunk_max,
                                     preview.join(" ")
                                 );
@@ -1259,14 +1204,13 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                         let mut count = callback_count.lock();
                         *count += 1;
                         if *count % 100 == 0 {
-                            let now = chrono::Local::now();
-                            println!("[{}] Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
-                                     now.format("%H:%M:%S"), *count, data.len(),
+                            info!("Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
+                                     *count, data.len(),
                                      state.audio_buffer.len(), state.audio_buffer.len() as f32 / VAD_SAMPLE_RATE as f32);
                         }
                     }
                 },
-                |err| eprintln!("Error in audio stream: {}", err),
+                |err| error!("Error in audio stream: {}", err),
                 None,
             )
         },
@@ -1300,14 +1244,17 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                         let mut count = callback_count.lock();
                         *count += 1;
                         if *count % 100 == 0 {
-                            let now = chrono::Local::now();
-                            println!("[{}] Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
-                                     now.format("%H:%M:%S"), *count, data.len(),
-                                     state.audio_buffer.len(), state.audio_buffer.len() as f32 / VAD_SAMPLE_RATE as f32);
+                            info!(
+                                "Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
+                                *count,
+                                data.len(),
+                                state.audio_buffer.len(),
+                                state.audio_buffer.len() as f32 / VAD_SAMPLE_RATE as f32
+                            );
                         }
                     }
                 },
-                |err| eprintln!("Error in audio stream: {}", err),
+                |err| error!("Error in audio stream: {}", err),
                 None,
             )
         },
@@ -1316,7 +1263,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         }
     }.map_err(|e| {
         let now = chrono::Local::now();
-        println!(
+        info!(
             "[{}] Failed to build audio stream: {}",
             now.format("%H:%M:%S"),
             e
@@ -1325,11 +1272,11 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     })?;
 
     let now = chrono::Local::now();
-    println!("[{}] Starting audio stream…", now.format("%H:%M:%S"));
+    info!("[{}] Starting audio stream…", now.format("%H:%M:%S"));
 
     stream.play().map_err(|e| {
         let now = chrono::Local::now();
-        println!(
+        info!(
             "[{}] Failed to start audio stream: {}",
             now.format("%H:%M:%S"),
             e
@@ -1338,7 +1285,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     })?;
 
     let now = chrono::Local::now();
-    println!(
+    info!(
         "[{}] Audio stream started successfully",
         now.format("%H:%M:%S")
     );
@@ -1354,7 +1301,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     std::mem::forget(stream);
 
     let now = chrono::Local::now();
-    println!(
+    info!(
         "[{}] Mic stream started successfully",
         now.format("%H:%M:%S")
     );
@@ -1372,7 +1319,7 @@ async fn start_recording(_app_handle: AppHandle, language: Option<String>) -> Re
     }
 
     let now = chrono::Local::now();
-    println!("[{}] Starting recording session...", now.format("%H:%M:%S"));
+    info!("[{}] Starting recording session...", now.format("%H:%M:%S"));
 
     state_guard.is_recording = true;
     state_guard.language = language.clone();
@@ -1386,7 +1333,7 @@ async fn start_recording(_app_handle: AppHandle, language: Option<String>) -> Re
     }
 
     let now = chrono::Local::now();
-    println!("[{}] Recording session started", now.format("%H:%M:%S"));
+    info!("[{}] Recording session started", now.format("%H:%M:%S"));
 
     Ok(())
 }
@@ -1401,7 +1348,7 @@ async fn update_language(language: Option<String>) -> Result<(), String> {
 
     let now = chrono::Local::now();
     let lang_str = language.as_deref().unwrap_or("auto");
-    println!("[{}] Language updated to: {}", now.format("%H:%M:%S"), lang_str);
+    info!("[{}] Language updated to: {}", now.format("%H:%M:%S"), lang_str);
 
     system_audio::update_language(language);
 
@@ -1418,13 +1365,13 @@ async fn stop_recording() -> Result<(), String> {
     }
 
     let now = chrono::Local::now();
-    println!("[{}] Stopping recording session...", now.format("%H:%M:%S"));
+    info!("[{}] Stopping recording session...", now.format("%H:%M:%S"));
 
     state_guard.is_recording = false;
     state_guard.current_recording_dir = None;
 
     let now = chrono::Local::now();
-    println!("[{}] Recording session stopped", now.format("%H:%M:%S"));
+    info!("[{}] Recording session stopped", now.format("%H:%M:%S"));
 
     Ok(())
 }
@@ -1443,7 +1390,7 @@ async fn start_mic(app_handle: AppHandle, language: Option<String>) -> Result<()
     }
 
     let now = chrono::Local::now();
-    println!("[{}] Microphone unmuted", now.format("%H:%M:%S"));
+    info!("[{}] Microphone unmuted", now.format("%H:%M:%S"));
 
     start_mic_stream(app_handle, language).await?;
 
@@ -1468,7 +1415,7 @@ async fn stop_mic() -> Result<(), String> {
     state_guard.vad_state = None;
 
     let now = chrono::Local::now();
-    println!("[{}] Microphone muted", now.format("%H:%M:%S"));
+    info!("[{}] Microphone muted", now.format("%H:%M:%S"));
 
     Ok(())
 }
@@ -1501,7 +1448,7 @@ pub(crate) fn emit_voice_activity_event(app_handle: &AppHandle, source: &str, is
             .as_secs(),
     };
     if let Err(e) = app_handle.emit("voice-activity", &event) {
-        eprintln!("Failed to emit voice activity event: {}", e);
+        error!("Failed to emit voice activity event: {}", e);
     }
 }
 
@@ -1564,7 +1511,7 @@ fn push_sample_with_optional_vad(state: &mut RecordingState, sample: f32, app_ha
                         }
                     }
                     Err(err) => {
-                        eprintln!("Silero VAD failed, disabling VAD: {}", err);
+                        error!("Silero VAD failed, disabling VAD: {}", err);
                         state.audio_buffer.extend_from_slice(&chunk);
                         state.session_audio.extend_from_slice(&chunk);
                         disable_vad = true;
@@ -1636,7 +1583,7 @@ fn flush_vad_pending(state: &mut RecordingState) {
                 }
             }
             Err(err) => {
-                eprintln!("Silero VAD failed during flush: {}", err);
+                error!("Silero VAD failed during flush: {}", err);
                 state.audio_buffer.extend_from_slice(&chunk[..original_len]);
                 state
                     .session_audio
@@ -1668,13 +1615,13 @@ async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
         .collect();
 
     let now = chrono::Local::now();
-    println!(
+    info!(
         "[{}] Detected {} audio input device(s)",
         now.format("%H:%M:%S"),
         devices.len()
     );
     for device in &devices {
-        println!(
+        info!(
             "  - {}{}",
             device.name,
             if device.is_default { " (default)" } else { "" }
@@ -1693,7 +1640,7 @@ async fn select_audio_device(device_name: String) -> Result<(), String> {
     state_guard.selected_device_name = Some(device_name.clone());
 
     let now = chrono::Local::now();
-    println!(
+    info!(
         "[{}] Selected audio device: {}",
         now.format("%H:%M:%S"),
         device_name
@@ -1734,7 +1681,7 @@ async fn set_streaming_config(config: StreamingConfig) -> Result<(), String> {
     }
 
     let now = chrono::Local::now();
-    println!(
+    info!(
         "[{}] Updated streaming config: threshold {:.4}, partial interval {:.2}s ({} samples)",
         now.format("%H:%M:%S"),
         clamped_threshold,
@@ -1756,7 +1703,7 @@ async fn check_microphone_permission() -> Result<bool, String> {
         .unwrap_or(false);
 
     let now = chrono::Local::now();
-    println!(
+    info!(
         "[{}] Microphone permission check: {}",
         now.format("%H:%M:%S"),
         if permission { "granted" } else { "denied" }
@@ -1801,10 +1748,10 @@ async fn set_recording_save_config(enabled: bool, path: Option<String>) -> Resul
     let now = chrono::Local::now();
     if enabled {
         if let Some(p) = &path {
-            println!("[{}] Recording save enabled: {}", now.format("%H:%M:%S"), p);
+            info!("[{}] Recording save enabled: {}", now.format("%H:%M:%S"), p);
         }
     } else {
-        println!("[{}] Recording save disabled", now.format("%H:%M:%S"));
+        info!("[{}] Recording save disabled", now.format("%H:%M:%S"));
     }
 
     Ok(())
@@ -1836,9 +1783,9 @@ async fn set_screen_recording_config(enabled: bool) -> Result<(), String> {
 
     let now = chrono::Local::now();
     if enabled {
-        println!("[{}] Screen recording enabled", now.format("%H:%M:%S"));
+        info!("[{}] Screen recording enabled", now.format("%H:%M:%S"));
     } else {
-        println!("[{}] Screen recording disabled", now.format("%H:%M:%S"));
+        info!("[{}] Screen recording disabled", now.format("%H:%M:%S"));
     }
 
     Ok(())
@@ -1878,11 +1825,7 @@ async fn start_screen_recording() -> Result<(), String> {
         let filename = format!("screen_recording_{}.mp4", timestamp);
         let full_path = std::path::Path::new(&dir).join(filename);
 
-        println!(
-            "[{}] Starting screen recording to: {}",
-            now.format("%H:%M:%S"),
-            full_path.display()
-        );
+        info!("Starting screen recording to: {}", full_path.display());
 
         screen_recording::start_screen_recording(full_path.to_str().unwrap())
     } else {
