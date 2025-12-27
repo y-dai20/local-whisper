@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use voice_activity_detector::VoiceActivityDetector;
-
+use log::{info, error};
 extern "C" {
     fn system_audio_start(callback: extern "C" fn(*const f32, c_int)) -> c_int;
     fn system_audio_stop() -> c_int;

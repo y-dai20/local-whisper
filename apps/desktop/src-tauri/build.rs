@@ -2,6 +2,8 @@ use std::env;
 use std::process::Command;
 
 fn main() {
+    env_logger::init();
+
     #[cfg(target_os = "macos")]
     {
         let swift_files = vec![

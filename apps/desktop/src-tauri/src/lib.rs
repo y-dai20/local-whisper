@@ -1,4 +1,5 @@
 use asr_core::{TranscribedSegment, WhisperContext, WhisperParams};
+use env_logger::Env;
 use chrono;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavSpec, WavWriter};
@@ -1262,32 +1263,25 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
             return Err("Unsupported sample format".to_string());
         }
     }.map_err(|e| {
-        let now = chrono::Local::now();
         info!(
-            "[{}] Failed to build audio stream: {}",
-            now.format("%H:%M:%S"),
+            "Failed to build audio stream: {}",
             e
         );
         format!("Failed to build stream: {}", e)
     })?;
 
-    let now = chrono::Local::now();
-    info!("[{}] Starting audio stream…", now.format("%H:%M:%S"));
+    info!("Starting audio stream…");
 
     stream.play().map_err(|e| {
-        let now = chrono::Local::now();
         info!(
-            "[{}] Failed to start audio stream: {}",
-            now.format("%H:%M:%S"),
+            "Failed to start audio stream: {}",
             e
         );
         format!("Failed to start stream: {}", e)
     })?;
 
-    let now = chrono::Local::now();
     info!(
-        "[{}] Audio stream started successfully",
-        now.format("%H:%M:%S")
+        "Audio stream started successfully",
     );
 
     {
@@ -1300,10 +1294,8 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     // This prevents Send trait issues while ensuring old callbacks can't write to new streams
     std::mem::forget(stream);
 
-    let now = chrono::Local::now();
     info!(
-        "[{}] Mic stream started successfully",
-        now.format("%H:%M:%S")
+        "Mic stream started successfully",
     );
 
     Ok(())
@@ -1318,8 +1310,7 @@ async fn start_recording(_app_handle: AppHandle, language: Option<String>) -> Re
         return Err("Already recording".to_string());
     }
 
-    let now = chrono::Local::now();
-    info!("[{}] Starting recording session...", now.format("%H:%M:%S"));
+    info!("Starting recording session...");
 
     state_guard.is_recording = true;
     state_guard.language = language.clone();
@@ -1332,8 +1323,7 @@ async fn start_recording(_app_handle: AppHandle, language: Option<String>) -> Re
         }
     }
 
-    let now = chrono::Local::now();
-    info!("[{}] Recording session started", now.format("%H:%M:%S"));
+    info!("Recording session started");
 
     Ok(())
 }
@@ -1346,9 +1336,8 @@ async fn update_language(language: Option<String>) -> Result<(), String> {
     state_guard.language = language.clone();
     drop(state_guard);
 
-    let now = chrono::Local::now();
     let lang_str = language.as_deref().unwrap_or("auto");
-    info!("[{}] Language updated to: {}", now.format("%H:%M:%S"), lang_str);
+    info!("Language updated to: {}", lang_str);
 
     system_audio::update_language(language);
 
@@ -1364,14 +1353,12 @@ async fn stop_recording() -> Result<(), String> {
         return Err("Not recording".to_string());
     }
 
-    let now = chrono::Local::now();
-    info!("[{}] Stopping recording session...", now.format("%H:%M:%S"));
+    info!("Stopping recording session...");
 
     state_guard.is_recording = false;
     state_guard.current_recording_dir = None;
 
-    let now = chrono::Local::now();
-    info!("[{}] Recording session stopped", now.format("%H:%M:%S"));
+    info!("Recording session stopped");
 
     Ok(())
 }
@@ -1389,8 +1376,7 @@ async fn start_mic(app_handle: AppHandle, language: Option<String>) -> Result<()
         state_guard.is_muted = false;
     }
 
-    let now = chrono::Local::now();
-    info!("[{}] Microphone unmuted", now.format("%H:%M:%S"));
+    info!("Microphone unmuted");
 
     start_mic_stream(app_handle, language).await?;
 
@@ -1414,8 +1400,7 @@ async fn stop_mic() -> Result<(), String> {
     flush_vad_pending(&mut state_guard);
     state_guard.vad_state = None;
 
-    let now = chrono::Local::now();
-    info!("[{}] Microphone muted", now.format("%H:%M:%S"));
+    info!("Microphone muted");
 
     Ok(())
 }
@@ -1614,10 +1599,8 @@ async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
         })
         .collect();
 
-    let now = chrono::Local::now();
     info!(
-        "[{}] Detected {} audio input device(s)",
-        now.format("%H:%M:%S"),
+        "Detected {} audio input device(s)",
         devices.len()
     );
     for device in &devices {
@@ -1639,10 +1622,8 @@ async fn select_audio_device(device_name: String) -> Result<(), String> {
     let mut state_guard = state.lock();
     state_guard.selected_device_name = Some(device_name.clone());
 
-    let now = chrono::Local::now();
     info!(
-        "[{}] Selected audio device: {}",
-        now.format("%H:%M:%S"),
+        "Selected audio device: {}",
         device_name
     );
 
@@ -1680,10 +1661,8 @@ async fn set_streaming_config(config: StreamingConfig) -> Result<(), String> {
         vad_state.threshold = clamped_threshold;
     }
 
-    let now = chrono::Local::now();
     info!(
-        "[{}] Updated streaming config: threshold {:.4}, partial interval {:.2}s ({} samples)",
-        now.format("%H:%M:%S"),
+        "Updated streaming config: threshold {:.4}, partial interval {:.2}s ({} samples)",
         clamped_threshold,
         clamped_interval_seconds,
         samples
@@ -1702,10 +1681,8 @@ async fn check_microphone_permission() -> Result<bool, String> {
         .map(|device| device.default_input_config().is_ok())
         .unwrap_or(false);
 
-    let now = chrono::Local::now();
     info!(
-        "[{}] Microphone permission check: {}",
-        now.format("%H:%M:%S"),
+        "Microphone permission check: {}",
         if permission { "granted" } else { "denied" }
     );
 
@@ -1745,13 +1722,12 @@ async fn set_recording_save_config(enabled: bool, path: Option<String>) -> Resul
     *path_guard = path.clone();
     drop(path_guard);
 
-    let now = chrono::Local::now();
     if enabled {
         if let Some(p) = &path {
-            info!("[{}] Recording save enabled: {}", now.format("%H:%M:%S"), p);
+            info!("Recording save enabled: {}", p);
         }
     } else {
-        info!("[{}] Recording save disabled", now.format("%H:%M:%S"));
+        info!("Recording save disabled");
     }
 
     Ok(())
@@ -1781,11 +1757,10 @@ async fn set_screen_recording_config(enabled: bool) -> Result<(), String> {
     let mut state_guard = state.lock();
     state_guard.screen_recording_enabled = enabled;
 
-    let now = chrono::Local::now();
     if enabled {
-        info!("[{}] Screen recording enabled", now.format("%H:%M:%S"));
+        info!("Screen recording enabled");
     } else {
-        info!("[{}] Screen recording disabled", now.format("%H:%M:%S"));
+        info!("Screen recording disabled");
     }
 
     Ok(())
@@ -1899,6 +1874,12 @@ fn resample_audio(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = env_logger::Builder::from_env(
+        Env::default().default_filter_or("info"),
+    )
+    .format_timestamp_millis()
+    .try_init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
