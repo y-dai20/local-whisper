@@ -756,46 +756,6 @@ async fn set_whisper_params(config: WhisperParamsConfig) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn transcribe_audio(
-    audio_data: Vec<f32>,
-    language: Option<String>,
-    app_handle: AppHandle,
-) -> Result<TranscriptionResult, String> {
-    let ctx_lock = WHISPER_CTX.get().ok_or("Whisper not initialized")?.clone();
-
-    let ctx_guard = ctx_lock.lock().unwrap();
-    let ctx = ctx_guard.as_ref().ok_or("Whisper context not available")?;
-
-    let lang = language.as_deref().unwrap_or("ja");
-
-    match ctx.transcribe_with_language(&audio_data, lang) {
-        Ok(text) => {
-            if let Err(err) = emit_transcription_segment(
-                &app_handle,
-                text.clone(),
-                Some(audio_data.clone()),
-                "manual_0".to_string(),
-                true,
-                "user".to_string(),
-            ) {
-                eprintln!("Failed to emit transcription segment: {}", err);
-            }
-
-            Ok(TranscriptionResult {
-                success: true,
-                text: Some(text),
-                error: None,
-            })
-        }
-        Err(e) => Ok(TranscriptionResult {
-            success: false,
-            text: None,
-            error: Some(e.to_string()),
-        }),
-    }
-}
-
-#[tauri::command]
 async fn list_remote_models() -> Result<Vec<RemoteModelStatus>, String> {
     let installed = read_installed_models()?;
     let mut statuses = Vec::new();
@@ -909,35 +869,6 @@ async fn delete_model(model_path: String) -> Result<(), String> {
     fs::remove_file(canonical_target)
         .await
         .map_err(|e| format!("Failed to delete model: {}", e))
-}
-
-#[tauri::command]
-async fn transcribe_audio_stream(
-    audio_data: Vec<i16>,
-    app_handle: AppHandle,
-) -> Result<(), String> {
-    let ctx_lock = WHISPER_CTX.get().ok_or("Whisper not initialized")?.clone();
-
-    let audio_f32 = asr_core::convert_pcm_to_f32(&audio_data);
-
-    let ctx_guard = ctx_lock.lock().unwrap();
-    let ctx = ctx_guard.as_ref().ok_or("Whisper context not available")?;
-
-    ctx.transcribe_with_callback(&audio_f32, |text| {
-        if let Err(err) = emit_transcription_segment(
-            &app_handle,
-            text.to_string(),
-            Some(audio_f32.clone()),
-            "stream_0".to_string(),
-            true,
-            "user".to_string(),
-        ) {
-            eprintln!("Failed to emit transcription segment: {}", err);
-        }
-    })
-    .map_err(|e| e.to_string())?;
-
-    Ok(())
 }
 
 async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
@@ -1841,8 +1772,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_models,
             initialize_whisper,
-            transcribe_audio,
-            transcribe_audio_stream,
             start_recording,
             stop_recording,
             update_language,
