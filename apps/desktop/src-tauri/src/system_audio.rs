@@ -1,13 +1,15 @@
-use hound::{WavSpec, WavWriter};
+use crate::audio::{
+    save_audio_session_to_wav, try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES,
+    VAD_CHUNK_SIZE, VAD_SAMPLE_RATE,
+};
+use log::{error, info};
 use parking_lot::Mutex as ParkingMutex;
 use std::os::raw::c_int;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use voice_activity_detector::VoiceActivityDetector;
-use log::{info, error};
 extern "C" {
     fn system_audio_start(callback: extern "C" fn(*const f32, c_int)) -> c_int;
     fn system_audio_stop() -> c_int;
@@ -29,14 +31,16 @@ struct SystemAudioSession {
 
 static mut SYSTEM_AUDIO_SESSION: Option<SystemAudioSession> = None;
 static mut APP_HANDLE: Option<AppHandle> = None;
-static mut RECORDING_STATE: Option<Arc<ParkingMutex<super::RecordingState>>> = None;
+static mut RECORDING_STATE: Option<Arc<ParkingMutex<RecordingState>>> = None;
 static SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SAMPLE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAST_LOG_INSTANT: Mutex<Option<Instant>> = Mutex::new(None);
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
-const VAD_CHUNK_SIZE: usize = 512;
-const SILENCE_TIMEOUT_SAMPLES: usize = 1 * 16000;
-const SESSION_MAX_SAMPLES: usize = 30 * 16000;
+fn current_session_max_samples() -> usize {
+    try_recording_state()
+        .map(|state| state.lock().session_max_samples)
+        .unwrap_or(30 * VAD_SAMPLE_RATE as usize)
+}
 
 extern "C" fn audio_callback(samples: *const f32, count: c_int) {
     unsafe {
@@ -103,9 +107,7 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
             let total_seconds = total_samples as f32 / 16000.0;
             info!(
                 "System audio: received {} samples (total {:.2}s, RMS {:.4})",
-                count,
-                total_seconds,
-                rms
+                count, total_seconds, rms
             );
             *last_log = Some(now);
         }
@@ -121,7 +123,10 @@ fn ensure_system_audio_session(session: &mut SystemAudioSession) {
     session.session_samples = 0;
     session.last_partial_emit_samples = 0;
     session.last_voice_sample = None;
-    info!("Starting SystemAudio session #{}", session.session_id_counter);
+    info!(
+        "Starting SystemAudio session #{}",
+        session.session_id_counter
+    );
 }
 
 fn process_system_audio_sample(
@@ -132,8 +137,6 @@ fn process_system_audio_sample(
 ) {
     session.session_samples += 1;
     session.vad_pending.push(sample);
-
-    let mut voice_detected = false;
 
     while session.vad_pending.len() >= VAD_CHUNK_SIZE {
         let chunk: Vec<f32> = session.vad_pending.drain(..VAD_CHUNK_SIZE).collect();
@@ -147,7 +150,6 @@ fn process_system_audio_sample(
         if probability > session.vad_threshold {
             session.session_audio.extend_from_slice(&chunk);
             session.last_voice_sample = Some(session.session_samples);
-            voice_detected = true;
             session.is_voice_active = true;
         } else {
             session.is_voice_active = false;
@@ -170,7 +172,7 @@ fn process_system_audio_sample(
         }
     }
 
-    if session.session_samples >= SESSION_MAX_SAMPLES {
+    if session.session_samples >= current_session_max_samples() {
         finalize_system_audio_session(session, "session_max_duration", app_handle, language);
         ensure_system_audio_session(session);
     }
@@ -225,12 +227,6 @@ fn finalize_system_audio_session(
         return;
     }
 
-    info!(
-        "Finalizing SystemAudio session #{} ({})",
-        session.session_id_counter,
-        reason,
-    );
-
     queue_system_audio_transcription(session, true, app_handle, language);
 
     unsafe {
@@ -241,31 +237,15 @@ fn finalize_system_audio_session(
             let is_recording = state.is_recording;
             drop(state);
 
-            // 録音セッション中のみ音声を保存
-            if save_enabled && is_recording {
-                if let Some(dir) = recording_dir {
-                    let audio_clone = session.session_audio.clone();
-                    let session_id = session.session_id_counter;
-                    let audio_len = audio_clone.len();
-                    let duration = audio_len as f32 / 16000.0;
-
-                    info!(
-                        "Saving system audio session #{}: {} samples ({:.2}s) to {}",
-                        session_id,
-                        audio_len,
-                        duration,
-                        dir
-                    );
-
-                    std::thread::spawn(move || {
-                        if let Err(e) = save_session_audio_to_wav(&audio_clone, session_id, &dir) {
-                            error!("Failed to save system audio session: {}", e);
-                        }
-                    });
-                } else {
-                    info!("Recording save enabled but no recording directory set");
-                }
-            }
+            crate::audio::finalize_session_common(
+                &session.session_audio,
+                session.session_id_counter,
+                reason,
+                "system",
+                save_enabled,
+                is_recording,
+                recording_dir.as_deref(),
+            );
         }
     }
 
@@ -282,44 +262,26 @@ fn transcribe_system_audio(
     is_final: bool,
     app_handle: &AppHandle,
 ) -> Result<(), String> {
-    use super::WHISPER_CTX;
-
-    let ctx_lock = WHISPER_CTX
-        .get()
-        .ok_or_else(|| "Whisper not initialized".to_string())?
-        .clone();
-    let ctx_guard = ctx_lock.lock().unwrap();
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| "Whisper context not available".to_string())?;
-
-    let text = ctx
-        .transcribe_with_language(audio_data, language)
-        .map_err(|e| e.to_string())?;
-
-    if text.trim().is_empty() {
-        return Ok(());
-    }
-
-    let session_id_str = format!("system_{}", session_id);
-
-    // Use emit_transcription_segment to save to txt file
-    super::emit_transcription_segment(
-        app_handle,
-        text,
-        if is_final {
-            Some(audio_data.to_vec())
-        } else {
-            None
-        },
-        session_id_str,
+    super::transcribe_and_emit_common(
+        audio_data,
+        language,
+        "system",
+        session_id,
         is_final,
-        "system".to_string(),
-    )
+        app_handle,
+        "system",
+        Some(&|new_counter| unsafe {
+            if let Some(session) = SYSTEM_AUDIO_SESSION.as_mut() {
+                session.session_id_counter = new_counter;
+            }
+        }),
+    )?;
+
+    Ok(())
 }
 
 pub fn start_system_audio_capture(
-    state: Arc<ParkingMutex<super::RecordingState>>,
+    state: Arc<ParkingMutex<RecordingState>>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
     unsafe {
@@ -369,9 +331,7 @@ pub fn start_system_audio_capture(
     }
 }
 
-pub fn stop_system_audio_capture(
-    state: Arc<ParkingMutex<super::RecordingState>>,
-) -> Result<(), String> {
+pub fn stop_system_audio_capture(state: Arc<ParkingMutex<RecordingState>>) -> Result<(), String> {
     unsafe {
         let result = system_audio_stop();
 
@@ -392,9 +352,7 @@ pub fn stop_system_audio_capture(
     }
 }
 
-pub fn update_language(
-    language: Option<String>,
-) -> Result<(), String> {
+pub fn update_language(language: Option<String>) -> Result<(), String> {
     unsafe {
         if let Some(state_arc) = &RECORDING_STATE {
             let mut state_guard = state_arc.lock();
@@ -409,69 +367,3 @@ pub fn update_language(
     Ok(())
 }
 
-fn save_session_audio_to_wav(
-    audio_data: &[f32],
-    session_id: u64,
-    recording_dir: &str,
-) -> Result<(), String> {
-    let start_time = std::time::Instant::now();
-    let now = chrono::Local::now();
-    let timestamp = now.format("%H%M%S");
-    let filename = format!("system_audio_session_{}_{}.wav", session_id, timestamp);
-
-    let mut path = PathBuf::from(recording_dir);
-
-    info!(
-        "Saving system audio to recording directory: {}",
-        path.display()
-    );
-
-    if !path.exists() {
-        info!(
-            "Creating directory: {}",
-            path.display()
-        );
-        std::fs::create_dir_all(&path).map_err(|e| format!("Failed to create directory: {}", e))?;
-    }
-
-    path.push(filename);
-
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate: 16000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    info!(
-        "Creating WAV file: {}",
-        path.display()
-    );
-
-    let mut writer =
-        WavWriter::create(&path, spec).map_err(|e| format!("Failed to create WAV file: {}", e))?;
-
-    for &sample in audio_data {
-        let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        writer
-            .write_sample(sample_i16)
-            .map_err(|e| format!("Failed to write sample: {}", e))?;
-    }
-
-    writer
-        .finalize()
-        .map_err(|e| format!("Failed to finalize WAV file: {}", e))?;
-
-    let elapsed = start_time.elapsed();
-    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-
-    info!(
-        "Successfully saved system audio session #{} to: {} ({} bytes, took {:.2}ms)",
-        session_id,
-        path.display(),
-        file_size,
-        elapsed.as_secs_f64() * 1000.0
-    );
-
-    Ok(())
-}

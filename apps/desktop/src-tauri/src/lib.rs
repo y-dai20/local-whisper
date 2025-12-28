@@ -1,15 +1,13 @@
 use asr_core::{TranscribedSegment, WhisperContext, WhisperParams};
-use env_logger::Env;
 use chrono;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use hound::{WavSpec, WavWriter};
-use log::{debug, error, info, warn};
+use env_logger::Env;
+use log::{debug, error, info};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex as ParkingMutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -18,8 +16,19 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use voice_activity_detector::VoiceActivityDetector;
 
+mod audio;
+mod commands;
 mod screen_recording;
 mod system_audio;
+mod transcription;
+
+use audio::constants::{
+    SILENCE_TIMEOUT_SAMPLES, VAD_CHUNK_SIZE, VAD_POST_BUFFER_SAMPLES, VAD_PRE_BUFFER_SAMPLES,
+    VAD_SAMPLE_RATE,
+};
+use audio::processing::{finalize_active_session, queue_transcription, trim_session_audio_samples};
+use audio::state::{recording_state, try_recording_state, RecordingState, SileroVadState};
+use transcription::{TranscriptionCommand, TranscriptionSegment};
 
 const REMOTE_MODELS: &[RemoteModel] = &[
     RemoteModel {
@@ -58,105 +67,8 @@ const REMOTE_MODELS: &[RemoteModel] = &[
 
 static WHISPER_CTX: OnceCell<Arc<Mutex<Option<WhisperContext>>>> = OnceCell::new();
 static WHISPER_PARAMS: OnceCell<Arc<ParkingMutex<WhisperParams>>> = OnceCell::new();
-static RECORDING_STATE: OnceCell<Arc<ParkingMutex<RecordingState>>> = OnceCell::new();
 static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCell::new();
-static MANUAL_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-const VAD_SAMPLE_RATE: u32 = 16_000;
-const MANUAL_SEGMENT_FINALIZE_DELAY_MS: i64 = 2_000;
-const MANUAL_SEGMENT_MAX_DURATION_MS: i64 = 8_000;
-const VAD_CHUNK_SIZE: usize = 512;
-const DEFAULT_VAD_THRESHOLD: f32 = 0.1;
-const DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES: usize = 4 * VAD_SAMPLE_RATE as usize;
-const SILENCE_TIMEOUT_SAMPLES: usize = 1 * VAD_SAMPLE_RATE as usize;
-const VAD_PRE_BUFFER_MS: usize = 200;
-const VAD_POST_BUFFER_MS: usize = 200;
-const VAD_PRE_BUFFER_SAMPLES: usize = (VAD_SAMPLE_RATE as usize * VAD_PRE_BUFFER_MS) / 1000;
-const VAD_POST_BUFFER_SAMPLES: usize = (VAD_SAMPLE_RATE as usize * VAD_POST_BUFFER_MS) / 1000;
-
-fn calculate_session_max_samples(audio_ctx: i32) -> usize {
-    let max_seconds = (audio_ctx as f32 / 1500.0 * 30.0).max(1.0);
-    (max_seconds * VAD_SAMPLE_RATE as f32) as usize
-}
-
-struct SileroVadState {
-    vad: VoiceActivityDetector,
-    pending: Vec<f32>,
-    threshold: f32,
-    pre_buffer: Vec<f32>,
-    post_buffer_remaining: usize,
-    is_voice_active: bool,
-}
-
-struct RecordingState {
-    is_recording: bool,
-    is_muted: bool,
-    mic_stream_id: u64,
-    audio_buffer: Vec<f32>,
-    session_audio: Vec<f32>,
-    sample_rate: u32,
-    selected_device_name: Option<String>,
-    vad_state: Option<SileroVadState>,
-    session_samples: usize,
-    last_voice_sample: Option<usize>,
-    last_partial_emit_samples: usize,
-    session_id_counter: u64,
-    transcription_tx: Option<mpsc::Sender<TranscriptionCommand>>,
-    transcription_handle: Option<JoinHandle<()>>,
-    language: Option<String>,
-    vad_threshold: f32,
-    partial_transcript_interval_samples: usize,
-    system_audio_enabled: bool,
-    recording_save_enabled: bool,
-    screen_recording_enabled: bool,
-    screen_recording_active: bool,
-    current_recording_dir: Option<String>,
-    last_vad_event_time: std::time::Instant,
-    session_max_samples: usize,
-}
-
-fn default_recording_state() -> RecordingState {
-    let default_params = WhisperParams::default();
-    RecordingState {
-        is_recording: false,
-        is_muted: true,
-        mic_stream_id: 0,
-        audio_buffer: Vec::new(),
-        session_audio: Vec::new(),
-        sample_rate: VAD_SAMPLE_RATE,
-        selected_device_name: None,
-        vad_state: None,
-        session_samples: 0,
-        last_voice_sample: None,
-        last_partial_emit_samples: 0,
-        session_id_counter: 0,
-        transcription_tx: None,
-        transcription_handle: None,
-        language: None,
-        vad_threshold: DEFAULT_VAD_THRESHOLD,
-        partial_transcript_interval_samples: DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES,
-        system_audio_enabled: false,
-        recording_save_enabled: false,
-        screen_recording_enabled: false,
-        screen_recording_active: false,
-        current_recording_dir: None,
-        last_vad_event_time: std::time::Instant::now(),
-        session_max_samples: calculate_session_max_samples(default_params.audio_ctx),
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TranscriptionSegment {
-    text: String,
-    timestamp: u64,
-    #[serde(rename = "audioData")]
-    audio_data: Option<Vec<f32>>,
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    #[serde(rename = "isFinal")]
-    is_final: bool,
-    source: String,
-}
+static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct VoiceActivityEvent {
@@ -230,8 +142,7 @@ pub(crate) fn emit_transcription_segment(
     };
 
     // 録画録音中の場合、txtファイルに保存
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+    let state = recording_state();
     let state_guard = state.lock();
     let recording_dir = if state_guard.is_recording {
         state_guard.current_recording_dir.clone()
@@ -256,10 +167,10 @@ fn slice_audio_segment(audio_data: &[f32], start_ms: i64, end_ms: i64) -> Vec<f3
         return Vec::new();
     }
 
-    let start_sample = ((start_ms * VAD_SAMPLE_RATE as i64) / 1000)
-        .clamp(0, audio_data.len() as i64) as usize;
-    let end_sample = ((end_ms * VAD_SAMPLE_RATE as i64) / 1000)
-        .clamp(0, audio_data.len() as i64) as usize;
+    let start_sample =
+        ((start_ms * VAD_SAMPLE_RATE as i64) / 1000).clamp(0, audio_data.len() as i64) as usize;
+    let end_sample =
+        ((end_ms * VAD_SAMPLE_RATE as i64) / 1000).clamp(0, audio_data.len() as i64) as usize;
 
     if start_sample >= end_sample || start_sample >= audio_data.len() {
         return Vec::new();
@@ -267,21 +178,8 @@ fn slice_audio_segment(audio_data: &[f32], start_ms: i64, end_ms: i64) -> Vec<f3
     audio_data[start_sample..end_sample.min(audio_data.len())].to_vec()
 }
 
-#[derive(Debug)]
-enum TranscriptionCommand {
-    Run {
-        audio: Vec<f32>,
-        language: Option<String>,
-        session_id: String,
-        is_final: bool,
-    },
-    Stop,
-}
-
 fn split_segments_on_punctuation(segments: &[TranscribedSegment]) -> Vec<PreparedSegment> {
-    const TERMINATORS: &[char] = &[
-        '。', '！', '？', '．', '!', '?', '.', ',', '、'
-    ];
+    const TERMINATORS: &[char] = &['。', '！', '？', '．', '!', '?', '.', ',', '、'];
     const FINALIZE_THRESHOLD_MS: i64 = 1_500;
 
     let mut prepared = Vec::new();
@@ -317,7 +215,8 @@ fn split_segments_on_punctuation(segments: &[TranscribedSegment]) -> Vec<Prepare
             .map(|c| TERMINATORS.contains(&c))
             .unwrap_or(false);
 
-        let is_far_enough_from_end = (last_segment_end_ms - segment.end_ms) >= FINALIZE_THRESHOLD_MS;
+        let is_far_enough_from_end =
+            (last_segment_end_ms - segment.end_ms) >= FINALIZE_THRESHOLD_MS;
         let should_split = has_terminator && is_far_enough_from_end;
 
         if should_split {
@@ -352,7 +251,10 @@ fn split_segments_on_punctuation(segments: &[TranscribedSegment]) -> Vec<Prepare
         });
     }
 
-    debug!("[split_segments] Result: {} prepared segments", prepared.len());
+    debug!(
+        "[split_segments] Result: {} prepared segments",
+        prepared.len()
+    );
     prepared
 }
 
@@ -409,24 +311,18 @@ fn spawn_transcription_worker(
                         if sessions_with_final.contains(&session_id) {
                             continue;
                         }
-                        if let Err(err) = transcribe_and_emit(
-                            &audio,
-                            language.clone(),
-                            is_final,
-                            &app_handle,
-                        ) {
+                        if let Err(err) =
+                            transcribe_and_emit(&audio, language.clone(), is_final, &app_handle)
+                        {
                             error!("Transcription worker error: {}", err);
                         }
                     }
 
                     // finalリクエストを処理
-                    for (audio, language, session_id, is_final) in final_requests {
-                        if let Err(err) = transcribe_and_emit(
-                            &audio,
-                            language.clone(),
-                            is_final,
-                            &app_handle,
-                        ) {
+                    for (audio, language, _session_id, is_final) in final_requests {
+                        if let Err(err) =
+                            transcribe_and_emit(&audio, language.clone(), is_final, &app_handle)
+                        {
                             error!("Transcription worker error: {}", err);
                         }
                     }
@@ -438,20 +334,16 @@ fn spawn_transcription_worker(
     (tx, handle)
 }
 
-fn transcribe_and_emit(
+pub(crate) fn transcribe_and_emit_common(
     audio_data: &[f32],
-    language: Option<String>,
+    language: &str,
+    session_id_prefix: &str,
+    session_id_counter: u64,
     is_final: bool,
     app_handle: &AppHandle,
-) -> Result<(), String> {
-    let state = RECORDING_STATE
-        .get()
-        .ok_or_else(|| "Recording state not initialized".to_string())?;
-
-    let session_id = {
-        let state_guard = state.lock();
-        format!("mic_{}", state_guard.session_id_counter)
-    };
+    source: &str,
+    on_session_rotate: Option<&dyn Fn(u64)>,
+) -> Result<Option<i64>, String> {
     let ctx_lock = WHISPER_CTX
         .get()
         .ok_or_else(|| "Whisper not initialized".to_string())?
@@ -461,36 +353,36 @@ fn transcribe_and_emit(
         .as_ref()
         .ok_or_else(|| "Whisper context not available".to_string())?;
 
-    let lang = language.as_deref().unwrap_or("ja");
+    let session_id = format!("{}_{}", session_id_prefix, session_id_counter);
 
     if is_final {
         let text = ctx
-            .transcribe_with_language(audio_data, lang)
+            .transcribe_with_language(audio_data, language)
             .map_err(|e| e.to_string())?;
 
-        let mut state_guard = state.lock();
-        state_guard.session_id_counter += 1;
-        let current_session_id = format!("mic_{}", state_guard.session_id_counter);
-        debug!("[transcribe_and_emit] Rotated session_id to: {}", current_session_id);
-        drop(state_guard);
+        if let Some(callback) = on_session_rotate {
+            callback(session_id_counter + 1);
+        }
 
-        return emit_transcription_segment(
+        emit_transcription_segment(
             app_handle,
             text,
             Some(audio_data.to_vec()),
             session_id,
             is_final,
-            "user".to_string(),
-        );
+            source.to_string(),
+        )?;
+
+        return Ok(None);
     }
 
     let segments = ctx
-        .transcribe_segments_with_language(audio_data, lang)
+        .transcribe_segments_with_language(audio_data, language)
         .map_err(|e| e.to_string())?;
 
     let prepared_segments = split_segments_on_punctuation(&segments);
     info!(
-        "[transcribe_and_emit] Got {} prepared segments from {} segments",
+        "[transcribe_and_emit_common] Got {} prepared segments from {} segments",
         prepared_segments.len(),
         segments.len()
     );
@@ -498,10 +390,11 @@ fn transcribe_and_emit(
     let mut finalized_cutoff_ms: Option<i64> = None;
     let total_segments = prepared_segments.len();
     let mut current_session_id = session_id.clone();
+    let mut current_counter = session_id_counter;
 
     for (idx, segment) in prepared_segments.iter().enumerate() {
         debug!(
-            "[transcribe_and_emit] Emitting segment #{}: {}ms - {}ms, text=\"{}\"",
+            "[transcribe_and_emit_common] Emitting segment #{}: {}ms - {}ms, text=\"{}\"",
             idx,
             segment.start_ms,
             segment.end_ms,
@@ -520,26 +413,69 @@ fn transcribe_and_emit(
             },
             current_session_id.clone(),
             segment_is_final,
-            "user".to_string(),
+            source.to_string(),
         ) {
             error!("Failed to emit transcription segment: {}", err);
         }
 
         if segment_is_final {
-            finalized_cutoff_ms = Some(finalized_cutoff_ms.map_or(segment.end_ms, |cutoff| cutoff.max(segment.end_ms)));
+            finalized_cutoff_ms = Some(
+                finalized_cutoff_ms.map_or(segment.end_ms, |cutoff| cutoff.max(segment.end_ms)),
+            );
 
-            let mut state_guard = state.lock();
-            state_guard.session_id_counter += 1;
-            current_session_id = format!("mic_{}", state_guard.session_id_counter);
-            debug!("[transcribe_and_emit] Rotated session_id to: {}", current_session_id);
+            current_counter += 1;
+            if let Some(callback) = on_session_rotate {
+                callback(current_counter);
+            }
+            current_session_id = format!("{}_{}", session_id_prefix, current_counter);
+            debug!(
+                "[transcribe_and_emit_common] Rotated session_id to: {}",
+                current_session_id
+            );
         }
     }
+
+    Ok(finalized_cutoff_ms)
+}
+
+fn transcribe_and_emit(
+    audio_data: &[f32],
+    language: Option<String>,
+    is_final: bool,
+    app_handle: &AppHandle,
+) -> Result<(), String> {
+    let state =
+        try_recording_state().ok_or_else(|| "Recording state not initialized".to_string())?;
+
+    let (session_id_counter, lang) = {
+        let state_guard = state.lock();
+        (
+            state_guard.session_id_counter,
+            language.as_deref().unwrap_or("ja").to_string(),
+        )
+    };
+
+    let finalized_cutoff_ms = transcribe_and_emit_common(
+        audio_data,
+        &lang,
+        "mic",
+        session_id_counter,
+        is_final,
+        app_handle,
+        "user",
+        Some(&|new_counter| {
+            if let Some(state) = try_recording_state() {
+                let mut state_guard = state.lock();
+                state_guard.session_id_counter = new_counter;
+            }
+        }),
+    )?;
 
     if let Some(cutoff_ms) = finalized_cutoff_ms {
         let cutoff_samples = ((cutoff_ms.max(0) * VAD_SAMPLE_RATE as i64) / 1000) as usize;
         let cutoff_samples = cutoff_samples.min(audio_data.len());
-        if cutoff_samples > 0 && session_id.starts_with("mic_") {
-            trim_mic_session_audio_samples(cutoff_samples);
+        if cutoff_samples > 0 {
+            trim_session_audio_samples(cutoff_samples);
         }
     }
 
@@ -595,180 +531,9 @@ fn setup_recording_directory(state: &mut RecordingState, base_path: &str) -> Res
     }
 
     state.current_recording_dir = Some(recording_dir.to_string_lossy().to_string());
-    info!(
-        "Recording directory prepared: {}",
-        recording_dir.display()
-    );
+    info!("Recording directory prepared: {}", recording_dir.display());
 
     Ok(())
-}
-
-fn queue_transcription(state: &RecordingState, is_final: bool) {
-    if state.session_audio.is_empty() {
-        return;
-    }
-    let Some(tx) = &state.transcription_tx else {
-        return;
-    };
-    let audio = state.session_audio.clone();
-    let language = state.language.clone();
-    let session_id_str = format!("mic_{}", state.session_id_counter);
-    if tx
-        .send(TranscriptionCommand::Run {
-            audio,
-            language,
-            session_id: session_id_str,
-            is_final,
-        })
-        .is_err()
-    {
-        error!("Failed to send transcription command");
-    }
-}
-
-fn trim_mic_session_audio_samples(cutoff_samples: usize) {
-    if cutoff_samples == 0 {
-        return;
-    }
-
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
-    let mut state_guard = state.lock();
-    if state_guard.session_audio.is_empty() {
-        return;
-    }
-
-    let trim = cutoff_samples.min(state_guard.session_audio.len());
-    if trim == 0 {
-        return;
-    }
-
-    state_guard.session_audio.drain(0..trim);
-    if trim >= state_guard.audio_buffer.len() {
-        state_guard.audio_buffer.clear();
-    } else {
-        state_guard.audio_buffer.drain(0..trim);
-    }
-
-    state_guard.session_samples = state_guard.session_samples.saturating_sub(trim);
-    state_guard.last_partial_emit_samples =
-        state_guard.last_partial_emit_samples.saturating_sub(trim);
-    if let Some(last_voice) = state_guard.last_voice_sample {
-        state_guard.last_voice_sample = last_voice.checked_sub(trim);
-    }
-
-    debug!(
-        "[trim_mic_session_audio_samples] Trimmed {} samples, remaining session_audio: {} samples",
-        trim,
-        state_guard.session_audio.len()
-    );
-}
-
-fn save_mic_session_audio_to_wav(
-    audio_data: &[f32],
-    session_id: u64,
-    recording_dir: &str,
-) -> Result<(), String> {
-    let start_time = std::time::Instant::now();
-    let now = chrono::Local::now();
-    let timestamp = now.format("%H%M%S");
-    let filename = format!("mic_audio_session_{}_{}.wav", session_id, timestamp);
-
-    let mut path = PathBuf::from(recording_dir);
-
-    info!("Saving mic audio to recording directory: {}", path.display());
-
-    if !path.exists() {
-        debug!("Creating directory: {}", path.display());
-        std::fs::create_dir_all(&path).map_err(|e| format!("Failed to create directory: {}", e))?;
-    }
-
-    path.push(filename);
-
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate: 16000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    debug!("Creating WAV file: {}", path.display());
-
-    let mut writer =
-        WavWriter::create(&path, spec).map_err(|e| format!("Failed to create WAV file: {}", e))?;
-
-    for &sample in audio_data {
-        let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        writer
-            .write_sample(sample_i16)
-            .map_err(|e| format!("Failed to write sample: {}", e))?;
-    }
-
-    writer
-        .finalize()
-        .map_err(|e| format!("Failed to finalize WAV file: {}", e))?;
-
-    let elapsed = start_time.elapsed();
-    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-
-    info!(
-        "Successfully saved microphone audio session #{} to: {} ({} bytes, took {:.2}ms)",
-        session_id,
-        path.display(),
-        file_size,
-        elapsed.as_secs_f64() * 1000.0
-    );
-
-    Ok(())
-}
-
-fn finalize_active_session(state: &mut RecordingState, reason: &str) {
-    if state.session_audio.is_empty() {
-        state.session_audio.clear();
-        state.session_samples = 0;
-        state.last_partial_emit_samples = 0;
-        state.last_voice_sample = None;
-        return;
-    }
-
-    info!(
-        "Finalizing session #{} ({})",
-        state.session_id_counter,
-        reason,
-    );
-    queue_transcription(state, true);
-
-    // 録音セッション中のみ音声を保存
-    if state.recording_save_enabled && state.is_recording {
-        if let Some(recording_dir) = &state.current_recording_dir {
-            let audio_clone = state.session_audio.clone();
-            let session_id = state.session_id_counter;
-            let audio_len = audio_clone.len();
-            let duration = audio_len as f32 / 16000.0;
-            let dir = recording_dir.clone();
-
-            info!(
-                "Saving microphone audio session #{}: {} samples ({:.2}s) to {}",
-                session_id,
-                audio_len,
-                duration,
-                dir
-            );
-
-            std::thread::spawn(move || {
-                if let Err(e) = save_mic_session_audio_to_wav(&audio_clone, session_id, &dir) {
-                    error!("Failed to save microphone audio session: {}", e);
-                }
-            });
-        } else {
-            debug!("Microphone audio save enabled but no recording directory set");
-        }
-    }
-
-    state.session_audio.clear();
-    state.session_samples = 0;
-    state.last_partial_emit_samples = 0;
-    state.last_voice_sample = None;
 }
 
 fn stop_transcription_worker(state: &mut RecordingState) {
@@ -869,13 +634,11 @@ fn read_installed_models() -> Result<Vec<ModelInfo>, String> {
     Ok(models)
 }
 
-#[tauri::command]
-async fn scan_models() -> Result<Vec<ModelInfo>, String> {
+pub(crate) async fn scan_models_impl() -> Result<Vec<ModelInfo>, String> {
     read_installed_models()
 }
 
-#[tauri::command]
-async fn initialize_whisper(model_path: String) -> Result<String, String> {
+pub(crate) async fn initialize_whisper_impl(model_path: String) -> Result<String, String> {
     let params_state =
         WHISPER_PARAMS.get_or_init(|| Arc::new(ParkingMutex::new(WhisperParams::default())));
 
@@ -900,15 +663,13 @@ fn whisper_params_state() -> Arc<ParkingMutex<WhisperParams>> {
         .clone()
 }
 
-#[tauri::command]
-async fn get_whisper_params() -> Result<WhisperParamsConfig, String> {
+pub(crate) async fn get_whisper_params_impl() -> Result<WhisperParamsConfig, String> {
     let state = whisper_params_state();
     let guard = state.lock();
     Ok(WhisperParamsConfig::from(*guard))
 }
 
-#[tauri::command]
-async fn set_whisper_params(config: WhisperParamsConfig) -> Result<(), String> {
+pub(crate) async fn set_whisper_params_impl(config: WhisperParamsConfig) -> Result<(), String> {
     let params: WhisperParams = config.into();
     let state = whisper_params_state();
     {
@@ -923,8 +684,8 @@ async fn set_whisper_params(config: WhisperParamsConfig) -> Result<(), String> {
         }
     }
 
-    let new_max_samples = calculate_session_max_samples(params.audio_ctx);
-    if let Some(recording_state) = RECORDING_STATE.get() {
+    let new_max_samples = audio::constants::calculate_session_max_samples(params.audio_ctx);
+    if let Some(recording_state) = try_recording_state() {
         let mut state_guard = recording_state.lock();
         state_guard.session_max_samples = new_max_samples;
     }
@@ -939,8 +700,7 @@ async fn set_whisper_params(config: WhisperParamsConfig) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-async fn list_remote_models() -> Result<Vec<RemoteModelStatus>, String> {
+pub(crate) async fn list_remote_models_impl() -> Result<Vec<RemoteModelStatus>, String> {
     let installed = read_installed_models()?;
     let mut statuses = Vec::new();
 
@@ -966,8 +726,7 @@ async fn list_remote_models() -> Result<Vec<RemoteModelStatus>, String> {
     Ok(statuses)
 }
 
-#[tauri::command]
-async fn install_model(model_id: String) -> Result<ModelInfo, String> {
+pub(crate) async fn install_model_impl(model_id: String) -> Result<ModelInfo, String> {
     let model = REMOTE_MODELS
         .iter()
         .find(|m| m.id == model_id)
@@ -1032,8 +791,7 @@ async fn install_model(model_id: String) -> Result<ModelInfo, String> {
     })
 }
 
-#[tauri::command]
-async fn delete_model(model_path: String) -> Result<(), String> {
+pub(crate) async fn delete_model_impl(model_path: String) -> Result<(), String> {
     let dir = model_directory()?;
     let canonical_dir =
         std::fs::canonicalize(&dir).map_err(|e| format!("Failed to resolve model dir: {}", e))?;
@@ -1056,8 +814,7 @@ async fn delete_model(model_path: String) -> Result<(), String> {
 }
 
 async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+    let state = recording_state();
 
     let (selected_device_name, current_mic_stream_id, configured_vad_threshold) = {
         let mut state_guard = state.lock();
@@ -1152,9 +909,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
             })
         }
         Err(err) => {
-            info!(
-                "Failed to initialize VAD: {err:?}. Falling back to raw audio.",
-            );
+            info!("Failed to initialize VAD: {err:?}. Falling back to raw audio.",);
             None
         }
     };
@@ -1164,7 +919,10 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         state_guard.vad_state = vad_state;
     }
 
-    info!("Building audio stream for format {:?}", config.sample_format());
+    info!(
+        "Building audio stream for format {:?}",
+        config.sample_format()
+    );
 
     // Build stream with recording ID check to prevent old callbacks from writing
     let stream = match config.sample_format() {
@@ -1287,16 +1045,11 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     info!("Starting audio stream…");
 
     stream.play().map_err(|e| {
-        info!(
-            "Failed to start audio stream: {}",
-            e
-        );
+        info!("Failed to start audio stream: {}", e);
         format!("Failed to start stream: {}", e)
     })?;
 
-    info!(
-        "Audio stream started successfully",
-    );
+    info!("Audio stream started successfully",);
 
     {
         let mut state_guard = state.lock();
@@ -1308,16 +1061,13 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
     // This prevents Send trait issues while ensuring old callbacks can't write to new streams
     std::mem::forget(stream);
 
-    info!(
-        "Mic stream started successfully",
-    );
+    info!("Mic stream started successfully",);
 
     Ok(())
 }
 
-#[tauri::command]
-async fn start_recording(_app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
-    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+pub(crate) async fn start_recording_impl(language: Option<String>) -> Result<(), String> {
+    let state = try_recording_state().ok_or("Recording not initialized")?;
 
     let mut state_guard = state.lock();
     if state_guard.is_recording {
@@ -1342,9 +1092,8 @@ async fn start_recording(_app_handle: AppHandle, language: Option<String>) -> Re
     Ok(())
 }
 
-#[tauri::command]
-async fn update_language(language: Option<String>) -> Result<(), String> {
-    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+pub(crate) async fn update_language_impl(language: Option<String>) -> Result<(), String> {
+    let state = try_recording_state().ok_or("Recording not initialized")?;
 
     let mut state_guard = state.lock();
     state_guard.language = language.clone();
@@ -1353,14 +1102,13 @@ async fn update_language(language: Option<String>) -> Result<(), String> {
     let lang_str = language.as_deref().unwrap_or("auto");
     info!("Language updated to: {}", lang_str);
 
-    system_audio::update_language(language);
+    let _ = system_audio::update_language(language);
 
     Ok(())
 }
 
-#[tauri::command]
-async fn stop_recording() -> Result<(), String> {
-    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+pub(crate) async fn stop_recording_impl() -> Result<(), String> {
+    let state = try_recording_state().ok_or("Recording not initialized")?;
 
     let mut state_guard = state.lock();
     if !state_guard.is_recording {
@@ -1377,10 +1125,8 @@ async fn stop_recording() -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-async fn start_mic(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn start_mic_impl(language: Option<String>) -> Result<(), String> {
+    let state = recording_state();
 
     {
         let mut state_guard = state.lock();
@@ -1392,15 +1138,14 @@ async fn start_mic(app_handle: AppHandle, language: Option<String>) -> Result<()
 
     info!("Microphone unmuted");
 
+    let app_handle = APP_HANDLE.get().ok_or("App not initialized")?.clone();
     start_mic_stream(app_handle, language).await?;
 
     Ok(())
 }
 
-#[tauri::command]
-async fn stop_mic() -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn stop_mic_impl() -> Result<(), String> {
+    let state = recording_state();
 
     let mut state_guard = state.lock();
     if state_guard.is_muted {
@@ -1419,10 +1164,8 @@ async fn stop_mic() -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-async fn get_mic_status() -> Result<bool, String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn get_mic_status_impl() -> Result<bool, String> {
+    let state = recording_state();
 
     let state_guard = state.lock();
     Ok(!state_guard.is_muted)
@@ -1597,8 +1340,7 @@ fn flush_vad_pending(state: &mut RecordingState) {
     }
 }
 
-#[tauri::command]
-async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
+pub(crate) async fn list_audio_devices_impl() -> Result<Vec<AudioDevice>, String> {
     let host = cpal::default_host();
     let default_device_name = host.default_input_device().and_then(|d| d.name().ok());
 
@@ -1613,10 +1355,7 @@ async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
         })
         .collect();
 
-    info!(
-        "Detected {} audio input device(s)",
-        devices.len()
-    );
+    info!("Detected {} audio input device(s)", devices.len());
     for device in &devices {
         info!(
             "  - {}{}",
@@ -1628,26 +1367,19 @@ async fn list_audio_devices() -> Result<Vec<AudioDevice>, String> {
     Ok(devices)
 }
 
-#[tauri::command]
-async fn select_audio_device(device_name: String) -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn select_audio_device_impl(device_name: String) -> Result<(), String> {
+    let state = recording_state();
 
     let mut state_guard = state.lock();
     state_guard.selected_device_name = Some(device_name.clone());
 
-    info!(
-        "Selected audio device: {}",
-        device_name
-    );
+    info!("Selected audio device: {}", device_name);
 
     Ok(())
 }
 
-#[tauri::command]
-async fn get_streaming_config() -> Result<StreamingConfig, String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn get_streaming_config_impl() -> Result<StreamingConfig, String> {
+    let state = recording_state();
 
     let state_guard = state.lock();
     Ok(StreamingConfig {
@@ -1657,10 +1389,8 @@ async fn get_streaming_config() -> Result<StreamingConfig, String> {
     })
 }
 
-#[tauri::command]
-async fn set_streaming_config(config: StreamingConfig) -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn set_streaming_config_impl(config: StreamingConfig) -> Result<(), String> {
+    let state = recording_state();
 
     let mut state_guard = state.lock();
     let clamped_threshold = config.vad_threshold.clamp(0.01, 0.99);
@@ -1677,16 +1407,13 @@ async fn set_streaming_config(config: StreamingConfig) -> Result<(), String> {
 
     info!(
         "Updated streaming config: threshold {:.4}, partial interval {:.2}s ({} samples)",
-        clamped_threshold,
-        clamped_interval_seconds,
-        samples
+        clamped_threshold, clamped_interval_seconds, samples
     );
 
     Ok(())
 }
 
-#[tauri::command]
-async fn check_microphone_permission() -> Result<bool, String> {
+pub(crate) async fn check_microphone_permission_impl() -> Result<bool, String> {
     // On macOS, try to access the default input device
     // If permission is denied, this will fail
     let host = cpal::default_host();
@@ -1703,29 +1430,28 @@ async fn check_microphone_permission() -> Result<bool, String> {
     Ok(permission)
 }
 
-#[tauri::command]
-async fn start_system_audio(app_handle: AppHandle) -> Result<(), String> {
-    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+pub(crate) async fn start_system_audio_impl() -> Result<(), String> {
+    let state = try_recording_state().ok_or("Recording not initialized")?;
+    let app_handle = APP_HANDLE.get().ok_or("App not initialized")?.clone();
     system_audio::start_system_audio_capture(state.clone(), app_handle)
 }
 
-#[tauri::command]
-async fn stop_system_audio() -> Result<(), String> {
-    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+pub(crate) async fn stop_system_audio_impl() -> Result<(), String> {
+    let state = try_recording_state().ok_or("Recording not initialized")?;
     system_audio::stop_system_audio_capture(state.clone())
 }
 
-#[tauri::command]
-async fn get_system_audio_status() -> Result<bool, String> {
-    let state = RECORDING_STATE.get().ok_or("Recording not initialized")?;
+pub(crate) async fn get_system_audio_status_impl() -> Result<bool, String> {
+    let state = try_recording_state().ok_or("Recording not initialized")?;
     let state_guard = state.lock();
     Ok(state_guard.system_audio_enabled)
 }
 
-#[tauri::command]
-async fn set_recording_save_config(enabled: bool, path: Option<String>) -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn set_recording_save_config_impl(
+    enabled: bool,
+    path: Option<String>,
+) -> Result<(), String> {
+    let state = recording_state();
 
     let mut state_guard = state.lock();
     state_guard.recording_save_enabled = enabled;
@@ -1747,10 +1473,8 @@ async fn set_recording_save_config(enabled: bool, path: Option<String>) -> Resul
     Ok(())
 }
 
-#[tauri::command]
-async fn get_recording_save_config() -> Result<(bool, Option<String>), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn get_recording_save_config_impl() -> Result<(bool, Option<String>), String> {
+    let state = recording_state();
 
     let state_guard = state.lock();
     let enabled = state_guard.recording_save_enabled;
@@ -1763,10 +1487,8 @@ async fn get_recording_save_config() -> Result<(bool, Option<String>), String> {
     Ok((enabled, path))
 }
 
-#[tauri::command]
-async fn set_screen_recording_config(enabled: bool) -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn set_screen_recording_config_impl(enabled: bool) -> Result<(), String> {
+    let state = recording_state();
 
     let mut state_guard = state.lock();
     state_guard.screen_recording_enabled = enabled;
@@ -1780,19 +1502,15 @@ async fn set_screen_recording_config(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-async fn get_screen_recording_config() -> Result<bool, String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn get_screen_recording_config_impl() -> Result<bool, String> {
+    let state = recording_state();
 
     let state_guard = state.lock();
     Ok(state_guard.screen_recording_enabled)
 }
 
-#[tauri::command]
-async fn start_screen_recording() -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn start_screen_recording_impl() -> Result<(), String> {
+    let state = recording_state();
 
     let mut state_guard = state.lock();
 
@@ -1822,10 +1540,8 @@ async fn start_screen_recording() -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-async fn stop_screen_recording() -> Result<(), String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn stop_screen_recording_impl() -> Result<(), String> {
+    let state = recording_state();
 
     let mut state_guard = state.lock();
     state_guard.screen_recording_active = false;
@@ -1834,17 +1550,14 @@ async fn stop_screen_recording() -> Result<(), String> {
     screen_recording::stop_screen_recording()
 }
 
-#[tauri::command]
-async fn get_screen_recording_status() -> Result<bool, String> {
-    let state =
-        RECORDING_STATE.get_or_init(|| Arc::new(ParkingMutex::new(default_recording_state())));
+pub(crate) async fn get_screen_recording_status_impl() -> Result<bool, String> {
+    let state = recording_state();
 
     let state_guard = state.lock();
     Ok(state_guard.screen_recording_active)
 }
 
-#[tauri::command]
-async fn get_supported_languages() -> Result<Vec<(String, String)>, String> {
+pub(crate) async fn get_supported_languages_impl() -> Result<Vec<(String, String)>, String> {
     Ok(vec![
         ("auto".to_string(), "自動検出".to_string()),
         ("ja".to_string(), "日本語".to_string()),
@@ -1888,45 +1601,19 @@ fn resample_audio(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = env_logger::Builder::from_env(
-        Env::default().default_filter_or("info"),
-    )
-    .format_timestamp_millis()
-    .try_init();
+    let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .try_init();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![
-            scan_models,
-            initialize_whisper,
-            start_recording,
-            stop_recording,
-            update_language,
-            start_mic,
-            stop_mic,
-            get_mic_status,
-            get_supported_languages,
-            list_remote_models,
-            install_model,
-            delete_model,
-            list_audio_devices,
-            select_audio_device,
-            get_streaming_config,
-            set_streaming_config,
-            get_whisper_params,
-            set_whisper_params,
-            set_recording_save_config,
-            get_recording_save_config,
-            set_screen_recording_config,
-            get_screen_recording_config,
-            start_screen_recording,
-            stop_screen_recording,
-            get_screen_recording_status,
-            check_microphone_permission,
-            start_system_audio,
-            stop_system_audio,
-            get_system_audio_status,
-        ])
-        .run(tauri::generate_context!())
+        .setup(|app| {
+            let _ = APP_HANDLE.set(app.handle().clone());
+            Ok(())
+        });
+
+    let app = commands::register(app);
+
+    app.run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
