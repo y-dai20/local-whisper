@@ -943,8 +943,6 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
         cpal::SampleFormat::F32 => {
             let state_clone = state.clone();
             let callback_count = Arc::new(ParkingMutex::new(0u64));
-            let zero_chunk_count = Arc::new(ParkingMutex::new(0u64));
-            let logged_non_zero = Arc::new(ParkingMutex::new(false));
 
             let app_handle_clone = app_handle.clone();
             device.build_input_stream(
@@ -965,79 +963,12 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                         if state.session_samples >= state.session_max_samples {
                             finalize_active_session(&mut state, "session_max_duration");
                         }
-                        let chunk_max = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        if chunk_max == 0.0 {
-                            let mut zero_count = zero_chunk_count.lock();
-                            *zero_count += 1;
-                            if *zero_count <= 5 {
-                                info!(
-                                    "Audio callback chunk all zeros (count #{}, {} samples)",
-                                    *zero_count,
-                                    data.len()
-                                );
-                            }
-                        } else {
-                            let mut logged_non_zero_guard = logged_non_zero.lock();
-                            if !*logged_non_zero_guard {
-                                *logged_non_zero_guard = true;
-                                let preview: Vec<String> = data.iter().take(10).map(|v| format!("{:.4}", v)).collect();
-                                info!(
-                                    "First non-zero chunk detected: max {:.4}, preview [{}]",
-                                    chunk_max,
-                                    preview.join(" ")
-                                );
-                            }
-                        }
                         let mut count = callback_count.lock();
                         *count += 1;
                         if *count % 100 == 0 {
                             info!("Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
                                      *count, data.len(),
                                      state.audio_buffer.len(), state.audio_buffer.len() as f32 / VAD_SAMPLE_RATE as f32);
-                        }
-                    }
-                },
-                |err| error!("Error in audio stream: {}", err),
-                None,
-            )
-        },
-        cpal::SampleFormat::I16 => {
-            let state_clone = state.clone();
-            let callback_count = Arc::new(ParkingMutex::new(0u64));
-            let app_handle_clone = app_handle.clone();
-
-            device.build_input_stream(
-                &config.into(),
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let mut state = state_clone.lock();
-                    if !state.is_muted && state.mic_stream_id == current_mic_stream_id {
-                        let mono_samples: Vec<f32> = data
-                            .iter()
-                            .step_by(channels)
-                            .map(|&sample| sample as f32 / i16::MAX as f32)
-                            .collect();
-                        let processed_samples = if device_sample_rate == VAD_SAMPLE_RATE {
-                            mono_samples
-                        } else {
-                            resample_audio(&mono_samples, device_sample_rate, VAD_SAMPLE_RATE)
-                        };
-                        for sample in processed_samples {
-                            push_sample_with_optional_vad(&mut state, sample, &app_handle_clone);
-                        }
-
-                        if state.session_samples >= state.session_max_samples {
-                            finalize_active_session(&mut state, "session_max_duration");
-                        }
-                        let mut count = callback_count.lock();
-                        *count += 1;
-                        if *count % 100 == 0 {
-                            info!(
-                                "Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
-                                *count,
-                                data.len(),
-                                state.audio_buffer.len(),
-                                state.audio_buffer.len() as f32 / VAD_SAMPLE_RATE as f32
-                            );
                         }
                     }
                 },

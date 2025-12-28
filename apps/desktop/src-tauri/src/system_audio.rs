@@ -33,7 +33,6 @@ static mut SYSTEM_AUDIO_SESSION: Option<SystemAudioSession> = None;
 static mut APP_HANDLE: Option<AppHandle> = None;
 static mut RECORDING_STATE: Option<Arc<ParkingMutex<RecordingState>>> = None;
 static SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
-static SAMPLE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAST_LOG_INSTANT: Mutex<Option<Instant>> = Mutex::new(None);
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
 fn current_session_max_samples() -> usize {
@@ -64,27 +63,11 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
 
         let mut sum_squares = 0.0_f32;
         let mut max_sample = 0.0_f32;
-        let mut non_zero_count = 0;
         for &sample in slice {
             sum_squares += sample * sample;
             max_sample = max_sample.max(sample.abs());
-            if sample.abs() > 0.0001 {
-                non_zero_count += 1;
-            }
-            process_system_audio_sample(session, sample, app_handle, language.as_deref());
-        }
 
-        let log_count = SAMPLE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-        if log_count < 5 {
-            let preview: Vec<String> = slice.iter().take(10).map(|v| format!("{:.6}", v)).collect();
-            info!(
-                "System audio sample details: count={}, max={:.6}, non_zero={}/{}, preview=[{}]",
-                count,
-                max_sample,
-                non_zero_count,
-                count,
-                preview.join(" ")
-            );
+            process_system_audio_sample(session, sample, app_handle, language.as_deref());
         }
 
         let rms = if count > 0 {
