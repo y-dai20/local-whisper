@@ -27,6 +27,7 @@ use audio::constants::{
     VAD_SAMPLE_RATE,
 };
 use audio::processing::{finalize_active_session, queue_transcription, trim_session_audio_samples};
+use audio::utils::resample_audio;
 use audio::state::{recording_state, try_recording_state, RecordingState, SileroVadState};
 use transcription::{TranscriptionCommand, TranscriptionSegment};
 
@@ -1584,32 +1585,6 @@ pub(crate) async fn get_supported_languages_impl() -> Result<Vec<(String, String
         ("pt".to_string(), "Português".to_string()),
         ("ru".to_string(), "Русский".to_string()),
     ])
-}
-
-// Linear resampling without aggressive filtering to preserve amplitude
-fn resample_audio(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate {
-        return input.to_vec();
-    }
-
-    let ratio = from_rate as f64 / to_rate as f64;
-    let output_len = ((input.len() as f64) / ratio).ceil() as usize;
-    let mut output = Vec::with_capacity(output_len);
-
-    for i in 0..output_len {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos.floor() as usize;
-        let frac = src_pos - idx as f64;
-
-        if idx + 1 < input.len() {
-            let sample = input[idx] as f64 * (1.0 - frac) + input[idx + 1] as f64 * frac;
-            output.push(sample as f32);
-        } else if idx < input.len() {
-            output.push(input[idx]);
-        }
-    }
-
-    output
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
