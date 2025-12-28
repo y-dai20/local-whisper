@@ -68,12 +68,16 @@ const MANUAL_SEGMENT_MAX_DURATION_MS: i64 = 8_000;
 const VAD_CHUNK_SIZE: usize = 512;
 const DEFAULT_VAD_THRESHOLD: f32 = 0.1;
 const DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES: usize = 4 * VAD_SAMPLE_RATE as usize;
-const SESSION_MAX_SAMPLES: usize = 30 * VAD_SAMPLE_RATE as usize;
 const SILENCE_TIMEOUT_SAMPLES: usize = 1 * VAD_SAMPLE_RATE as usize;
 const VAD_PRE_BUFFER_MS: usize = 200;
 const VAD_POST_BUFFER_MS: usize = 200;
 const VAD_PRE_BUFFER_SAMPLES: usize = (VAD_SAMPLE_RATE as usize * VAD_PRE_BUFFER_MS) / 1000;
 const VAD_POST_BUFFER_SAMPLES: usize = (VAD_SAMPLE_RATE as usize * VAD_POST_BUFFER_MS) / 1000;
+
+fn calculate_session_max_samples(audio_ctx: i32) -> usize {
+    let max_seconds = (audio_ctx as f32 / 1500.0 * 30.0).max(1.0);
+    (max_seconds * VAD_SAMPLE_RATE as f32) as usize
+}
 
 struct SileroVadState {
     vad: VoiceActivityDetector,
@@ -108,9 +112,11 @@ struct RecordingState {
     screen_recording_active: bool,
     current_recording_dir: Option<String>,
     last_vad_event_time: std::time::Instant,
+    session_max_samples: usize,
 }
 
 fn default_recording_state() -> RecordingState {
+    let default_params = WhisperParams::default();
     RecordingState {
         is_recording: false,
         is_muted: true,
@@ -135,6 +141,7 @@ fn default_recording_state() -> RecordingState {
         screen_recording_active: false,
         current_recording_dir: None,
         last_vad_event_time: std::time::Instant::now(),
+        session_max_samples: calculate_session_max_samples(default_params.audio_ctx),
     }
 }
 
@@ -916,10 +923,17 @@ async fn set_whisper_params(config: WhisperParamsConfig) -> Result<(), String> {
         }
     }
 
+    let new_max_samples = calculate_session_max_samples(params.audio_ctx);
+    if let Some(recording_state) = RECORDING_STATE.get() {
+        let mut state_guard = recording_state.lock();
+        state_guard.session_max_samples = new_max_samples;
+    }
+
     info!(
-        "Updated Whisper params: audio_ctx {}, temperature {:.2}",
+        "Updated Whisper params: audio_ctx {}, temperature {:.2}, max session duration {:.1}s",
         params.audio_ctx,
-        params.temperature
+        params.temperature,
+        new_max_samples as f32 / VAD_SAMPLE_RATE as f32
     );
 
     Ok(())
@@ -1176,7 +1190,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                             push_sample_with_optional_vad(&mut state, sample, &app_handle_clone);
                         }
 
-                        if state.session_samples >= SESSION_MAX_SAMPLES {
+                        if state.session_samples >= state.session_max_samples {
                             finalize_active_session(&mut state, "session_max_duration");
                         }
                         let chunk_max = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
@@ -1239,7 +1253,7 @@ async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Re
                             push_sample_with_optional_vad(&mut state, sample, &app_handle_clone);
                         }
 
-                        if state.session_samples >= SESSION_MAX_SAMPLES {
+                        if state.session_samples >= state.session_max_samples {
                             finalize_active_session(&mut state, "session_max_duration");
                         }
                         let mut count = callback_count.lock();
