@@ -2,7 +2,7 @@ use crate::audio::{
     save_audio_session_to_wav, try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES,
     VAD_CHUNK_SIZE, VAD_SAMPLE_RATE,
 };
-use log::{error, info};
+use log::{error, info, debug};
 use parking_lot::Mutex as ParkingMutex;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,8 +62,6 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
 
         let slice = std::slice::from_raw_parts(samples, count as usize);
 
-        ensure_system_audio_session(session);
-
         let mut sum_squares = 0.0_f32;
         let mut max_sample = 0.0_f32;
         let mut non_zero_count = 0;
@@ -114,21 +112,6 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
     }
 }
 
-fn ensure_system_audio_session(session: &mut SystemAudioSession) {
-    if session.session_id_counter > 0 && !session.session_audio.is_empty() {
-        return;
-    }
-    session.session_id_counter = session.session_id_counter.wrapping_add(1);
-    session.session_audio.clear();
-    session.session_samples = 0;
-    session.last_partial_emit_samples = 0;
-    session.last_voice_sample = None;
-    info!(
-        "Starting SystemAudio session #{}",
-        session.session_id_counter
-    );
-}
-
 fn process_system_audio_sample(
     session: &mut SystemAudioSession,
     sample: f32,
@@ -168,13 +151,11 @@ fn process_system_audio_sample(
     if let Some(last_voice) = session.last_voice_sample {
         if session.session_samples - last_voice >= SILENCE_TIMEOUT_SAMPLES {
             finalize_system_audio_session(session, "silence_timeout", app_handle, language);
-            ensure_system_audio_session(session);
         }
     }
 
     if session.session_samples >= current_session_max_samples() {
         finalize_system_audio_session(session, "session_max_duration", app_handle, language);
-        ensure_system_audio_session(session);
     }
 
     if session.session_samples - session.last_partial_emit_samples
@@ -192,9 +173,6 @@ fn queue_system_audio_transcription(
     language: Option<&str>,
 ) {
     if session.session_audio.is_empty() {
-        return;
-    }
-    if session.session_id_counter == 0 {
         return;
     }
     let Some(app) = app_handle else {
@@ -262,7 +240,7 @@ fn transcribe_system_audio(
     is_final: bool,
     app_handle: &AppHandle,
 ) -> Result<(), String> {
-    super::transcribe_and_emit_common(
+    let finalized_cutoff_ms = super::transcribe_and_emit_common(
         audio_data,
         language,
         "system",
@@ -277,7 +255,47 @@ fn transcribe_system_audio(
         }),
     )?;
 
+    if let Some(cutoff_ms) = finalized_cutoff_ms {
+        let cutoff_samples = ((cutoff_ms.max(0) * VAD_SAMPLE_RATE as i64) / 1000) as usize;
+        trim_system_session_audio_samples(cutoff_samples);
+    }
+
     Ok(())
+}
+
+fn trim_system_session_audio_samples(cutoff_samples: usize) {
+    if cutoff_samples == 0 {
+        return;
+    }
+
+    unsafe {
+        let Some(session) = SYSTEM_AUDIO_SESSION.as_mut() else {
+            return;
+        };
+
+        if session.session_audio.is_empty() {
+            return;
+        }
+
+        let trim = cutoff_samples.min(session.session_audio.len());
+        if trim == 0 {
+            return;
+        }
+
+        session.session_audio.drain(0..trim);
+        session.session_samples = session.session_samples.saturating_sub(trim);
+        session.last_partial_emit_samples =
+            session.last_partial_emit_samples.saturating_sub(trim);
+        if let Some(last_voice) = session.last_voice_sample {
+            session.last_voice_sample = last_voice.checked_sub(trim);
+        }
+
+        debug!(
+            "[trim_system_session_audio_samples] Trimmed {} samples, remaining session_audio: {} samples",
+            trim,
+            session.session_audio.len()
+        );
+    }
 }
 
 pub fn start_system_audio_capture(

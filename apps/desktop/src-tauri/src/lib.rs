@@ -251,6 +251,19 @@ fn split_segments_on_punctuation(segments: &[TranscribedSegment]) -> Vec<Prepare
         });
     }
 
+    if prepared.len() > 2 {
+        let mut combined = prepared.first().cloned().unwrap();
+        for segment in prepared.iter().take(prepared.len() - 1).skip(1) {
+            if !combined.text.trim_end().is_empty() {
+                combined.text.push('\n');
+            }
+            combined.text.push_str(segment.text.trim_start());
+            combined.end_ms = segment.end_ms;
+        }
+        let last = prepared.last().cloned().unwrap();
+        prepared = vec![combined, last];
+    }
+
     debug!(
         "[split_segments] Result: {} prepared segments",
         prepared.len()
