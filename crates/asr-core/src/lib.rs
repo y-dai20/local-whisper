@@ -1,9 +1,14 @@
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::Instant;
 use thiserror::Error;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext as WhisperRsContext, WhisperContextParameters,
 };
+
+const WHISPER_SAMPLE_RATE: usize = 16_000;
+const MIN_AUDIO_DURATION_S: usize = 2;
+const MIN_AUDIO_SAMPLES: usize = WHISPER_SAMPLE_RATE * MIN_AUDIO_DURATION_S;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WhisperParams {
@@ -118,9 +123,10 @@ impl WhisperContext {
         params.set_max_len(1);
         params.set_split_on_word(true);
 
+        let audio_for_inference = ensure_min_audio_duration(audio_data);
         let inference_start = Instant::now();
         state
-            .full(params, audio_data)
+            .full(params, audio_for_inference.as_ref())
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
         let _inference_elapsed = inference_start.elapsed();
 
@@ -199,6 +205,18 @@ fn collect_words(
     }
 
     Ok(words)
+}
+
+fn ensure_min_audio_duration(audio_data: &[f32]) -> Cow<'_, [f32]> {
+    if audio_data.len() >= MIN_AUDIO_SAMPLES {
+        Cow::Borrowed(audio_data)
+    } else {
+        let pad_len = MIN_AUDIO_SAMPLES - audio_data.len();
+        let mut padded = Vec::with_capacity(MIN_AUDIO_SAMPLES);
+        padded.resize(pad_len, 0.0);
+        padded.extend_from_slice(audio_data);
+        Cow::Owned(padded)
+    }
 }
 
 fn num_cpus() -> i32 {
