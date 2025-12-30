@@ -9,49 +9,7 @@ use super::constants::{
 };
 use super::state::{recording_state, RecordingState, SileroVadState};
 use crate::emit_voice_activity_event;
-use crate::transcription::TranscriptionCommand;
-
-pub fn queue_transcription_with_source(
-    audio: Vec<f32>,
-    language: Option<String>,
-    session_id_counter: u64,
-    source_prefix: &str,
-    is_final: bool,
-    tx: &std::sync::mpsc::Sender<TranscriptionCommand>,
-) {
-    if audio.is_empty() {
-        return;
-    }
-    let session_id_str = format!("{}_{}", source_prefix, session_id_counter);
-    if tx
-        .send(TranscriptionCommand::Run {
-            audio,
-            language,
-            session_id: session_id_str,
-            is_final,
-        })
-        .is_err()
-    {
-        error!("Failed to send transcription command");
-    }
-}
-
-pub fn queue_transcription(state: &RecordingState, is_final: bool) {
-    if state.session_audio.is_empty() {
-        return;
-    }
-    let Some(tx) = &state.transcription_tx else {
-        return;
-    };
-    queue_transcription_with_source(
-        state.session_audio.clone(),
-        state.language.clone(),
-        state.session_id_counter,
-        "mic",
-        is_final,
-        tx,
-    );
-}
+use crate::transcription::worker::queue_transcription;
 
 pub fn finalize_session_common(
     audio: &[f32],

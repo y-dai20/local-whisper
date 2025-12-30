@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use tauri::AppHandle;
+use std::sync::mpsc::Sender;
 
+use crate::audio::state::RecordingState;
 use crate::audio::constants::VAD_SAMPLE_RATE;
 use crate::audio::processing::trim_session_audio_samples;
 use crate::audio::state::try_recording_state;
@@ -345,4 +347,50 @@ fn transcribe_and_emit(
     }
 
     Ok(())
+}
+
+
+pub fn queue_transcription_with_source(
+    audio: Vec<f32>,
+    language: Option<String>,
+    session_id_counter: u64,
+    source_prefix: &str,
+    is_final: bool,
+    tx: &Sender<TranscriptionCommand>,
+) {
+    if audio.is_empty() {
+        return;
+    }
+
+    let session_id_str = format!("{}_{}", source_prefix, session_id_counter);
+
+    if tx
+        .send(TranscriptionCommand::Run {
+            audio,
+            language,
+            session_id: session_id_str,
+            is_final,
+        })
+        .is_err()
+    {
+        log::error!("Failed to send transcription command");
+    }
+}
+
+pub fn queue_transcription(state: &RecordingState, is_final: bool) {
+    if state.session_audio.is_empty() {
+        return;
+    }
+    let Some(tx) = &state.transcription_tx else {
+        return;
+    };
+
+    queue_transcription_with_source(
+        state.session_audio.clone(),
+        state.language.clone(),
+        state.session_id_counter,
+        "mic",
+        is_final,
+        tx,
+    );
 }
