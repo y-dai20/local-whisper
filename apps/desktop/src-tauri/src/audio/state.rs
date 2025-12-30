@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -84,7 +83,6 @@ pub fn default_recording_state() -> RecordingState {
 }
 
 static RECORDING_STATE: OnceCell<Arc<ParkingMutex<RecordingState>>> = OnceCell::new();
-static MANUAL_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn recording_state() -> Arc<ParkingMutex<RecordingState>> {
     RECORDING_STATE
@@ -96,6 +94,3 @@ pub fn try_recording_state() -> Option<Arc<ParkingMutex<RecordingState>>> {
     RECORDING_STATE.get().cloned()
 }
 
-pub fn manual_session_counter() -> &'static AtomicU64 {
-    &MANUAL_SESSION_COUNTER
-}

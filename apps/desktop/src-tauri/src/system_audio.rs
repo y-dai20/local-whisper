@@ -1,7 +1,8 @@
 use crate::audio::{
-    save_audio_session_to_wav, try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES,
+    try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES,
     VAD_CHUNK_SIZE, VAD_SAMPLE_RATE,
 };
+use std::ptr::{addr_of, addr_of_mut};
 use log::{error, info, debug};
 use parking_lot::Mutex as ParkingMutex;
 use std::os::raw::c_int;
@@ -43,10 +44,12 @@ fn current_session_max_samples() -> usize {
 
 extern "C" fn audio_callback(samples: *const f32, count: c_int) {
     unsafe {
-        let Some(session) = SYSTEM_AUDIO_SESSION.as_mut() else {
+        let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
+        let Some(session) = (*session_ptr).as_mut() else {
             return;
         };
-        let Some(state_arc) = &RECORDING_STATE else {
+        let state_ptr = addr_of!(RECORDING_STATE);
+        let Some(state_arc) = (*state_ptr).as_ref() else {
             return;
         };
         let state = state_arc.lock();
@@ -55,7 +58,8 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
             return;
         }
 
-        let app_handle = APP_HANDLE.as_ref();
+        let app_handle_ptr = addr_of!(APP_HANDLE);
+        let app_handle = (*app_handle_ptr).as_ref();
         let language = state.language.clone();
         drop(state);
 
@@ -191,7 +195,8 @@ fn finalize_system_audio_session(
     queue_system_audio_transcription(session, true, app_handle, language);
 
     unsafe {
-        if let Some(state_arc) = &RECORDING_STATE {
+        let state_ptr = addr_of!(RECORDING_STATE);
+        if let Some(state_arc) = (*state_ptr).as_ref() {
             let state = state_arc.lock();
             let save_enabled = state.recording_save_enabled;
             let recording_dir = state.current_recording_dir.clone();
@@ -232,7 +237,8 @@ fn transcribe_system_audio(
         app_handle,
         "system",
         Some(&|new_counter| unsafe {
-            if let Some(session) = SYSTEM_AUDIO_SESSION.as_mut() {
+            let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
+            if let Some(session) = (*session_ptr).as_mut() {
                 session.session_id_counter = new_counter;
             }
         }),
@@ -252,7 +258,8 @@ fn trim_system_session_audio_samples(cutoff_samples: usize) {
     }
 
     unsafe {
-        let Some(session) = SYSTEM_AUDIO_SESSION.as_mut() else {
+        let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
+        let Some(session) = (*session_ptr).as_mut() else {
             return;
         };
 
@@ -355,7 +362,8 @@ pub fn stop_system_audio_capture(state: Arc<ParkingMutex<RecordingState>>) -> Re
 
 pub fn update_language(language: Option<String>) -> Result<(), String> {
     unsafe {
-        if let Some(state_arc) = &RECORDING_STATE {
+        let state_ptr = addr_of!(RECORDING_STATE);
+        if let Some(state_arc) = (*state_ptr).as_ref() {
             let mut state_guard = state_arc.lock();
             state_guard.language = language.clone();
             drop(state_guard);

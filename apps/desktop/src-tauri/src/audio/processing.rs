@@ -161,6 +161,18 @@ pub fn trim_session_audio_samples(cutoff_samples: usize) {
     );
 }
 
+fn process_vad_chunk_only(
+    vad_state: &mut SileroVadState,
+    chunk: &[f32],
+) -> Result<f32, String> {
+    let chunk_i16: Vec<i16> = chunk
+        .iter()
+        .map(|&sample| (sample * i16::MAX as f32) as i16)
+        .collect();
+    let probability = vad_state.vad.predict(chunk_i16);
+    Ok(probability)
+}
+
 pub fn push_sample_with_optional_vad(
     state: &mut RecordingState,
     sample: f32,
@@ -260,61 +272,6 @@ pub fn push_sample_with_optional_vad(
         queue_transcription(state, false);
         state.last_partial_emit_samples = state.session_samples;
     }
-}
-
-pub fn flush_vad_pending(state: &mut RecordingState) {
-    if state.vad_state.is_none() {
-        return;
-    }
-
-    let mut disable_vad = false;
-    if let Some(vad_state) = state.vad_state.as_mut() {
-        if vad_state.pending.is_empty() {
-            return;
-        }
-
-        let mut chunk = vad_state.pending.clone();
-        let original_len = chunk.len();
-        vad_state.pending.clear();
-        if chunk.len() < VAD_CHUNK_SIZE {
-            chunk.resize(VAD_CHUNK_SIZE, 0.0);
-        }
-
-        match process_vad_chunk_only(vad_state, &chunk) {
-            Ok(prob) => {
-                if prob >= vad_state.threshold {
-                    state.audio_buffer.extend_from_slice(&chunk[..original_len]);
-                    state
-                        .session_audio
-                        .extend_from_slice(&chunk[..original_len]);
-                }
-            }
-            Err(err) => {
-                error!("Silero VAD failed during flush: {}", err);
-                state.audio_buffer.extend_from_slice(&chunk[..original_len]);
-                state
-                    .session_audio
-                    .extend_from_slice(&chunk[..original_len]);
-                disable_vad = true;
-            }
-        }
-    }
-
-    if disable_vad {
-        state.vad_state = None;
-    }
-}
-
-pub fn process_vad_chunk_only(
-    vad_state: &mut SileroVadState,
-    chunk: &[f32],
-) -> Result<f32, String> {
-    let chunk_i16: Vec<i16> = chunk
-        .iter()
-        .map(|&sample| (sample * i16::MAX as f32) as i16)
-        .collect();
-    let probability = vad_state.vad.predict(chunk_i16);
-    Ok(probability)
 }
 
 pub fn save_audio_session_to_wav(

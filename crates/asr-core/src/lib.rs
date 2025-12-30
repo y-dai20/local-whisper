@@ -122,7 +122,7 @@ impl WhisperContext {
         state
             .full(params, audio_data)
             .map_err(|e| WhisperError::ProcessingFailed(e.to_string()))?;
-        let inference_elapsed = inference_start.elapsed();
+        let _inference_elapsed = inference_start.elapsed();
 
         let num_segments = state
             .full_n_segments()
