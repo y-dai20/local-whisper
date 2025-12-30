@@ -394,3 +394,12 @@ pub fn queue_transcription(state: &RecordingState, is_final: bool) {
         tx,
     );
 }
+
+pub fn stop_transcription_worker(state: &mut RecordingState) {
+    if let Some(tx) = state.transcription_tx.take() {
+        let _ = tx.send(TranscriptionCommand::Stop);
+    }
+    if let Some(handle) = state.transcription_handle.take() {
+        let _ = handle.join();
+    }
+}

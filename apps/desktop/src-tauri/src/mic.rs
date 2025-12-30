@@ -7,18 +7,10 @@ use voice_activity_detector::VoiceActivityDetector;
 
 use crate::audio::constants::{VAD_CHUNK_SIZE, VAD_SAMPLE_RATE};
 use crate::audio::processing::finalize_active_session;
-use crate::audio::state::{recording_state, RecordingState, SileroVadState};
+use crate::audio::state::{recording_state, SileroVadState};
 use crate::audio::utils::resample_audio;
-use crate::transcription::{spawn_transcription_worker, TranscriptionCommand};
-
-pub fn stop_transcription_worker(state: &mut RecordingState) {
-    if let Some(tx) = state.transcription_tx.take() {
-        let _ = tx.send(TranscriptionCommand::Stop);
-    }
-    if let Some(handle) = state.transcription_handle.take() {
-        let _ = handle.join();
-    }
-}
+use crate::transcription::{spawn_transcription_worker};
+use crate::transcription::worker::stop_transcription_worker;
 
 pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
     let state = recording_state();

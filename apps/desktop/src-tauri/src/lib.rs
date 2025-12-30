@@ -26,8 +26,9 @@ pub use whisper::{
 use audio::constants::VAD_SAMPLE_RATE;
 use audio::processing::finalize_active_session;
 use audio::state::{recording_state, try_recording_state, RecordingState};
-use mic::{start_mic_stream, stop_transcription_worker};
+use mic::{start_mic_stream};
 use transcription::{transcribe_and_emit_common, TranscriptionSegment};
+use transcription::worker::stop_transcription_worker;
 
 static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCell::new();
 static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
