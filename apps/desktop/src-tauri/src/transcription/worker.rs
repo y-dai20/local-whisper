@@ -8,7 +8,6 @@ use std::sync::mpsc::Sender;
 
 use crate::audio::state::RecordingState;
 use crate::audio::constants::VAD_SAMPLE_RATE;
-use crate::audio::processing::trim_session_audio_samples;
 use crate::audio::state::try_recording_state;
 use crate::emit_transcription_segment;
 use crate::whisper::WHISPER_CTX;
@@ -38,7 +37,7 @@ fn slice_audio_segment(audio_data: &[f32], start_ms: i64, end_ms: i64) -> Vec<f3
     audio_data[start_sample..end_sample.min(audio_data.len())].to_vec()
 }
 
-pub fn split_segments_on_punctuation(segments: &[TranscribedSegment]) -> Vec<PreparedSegment> {
+fn split_segments_on_punctuation(segments: &[TranscribedSegment]) -> Vec<PreparedSegment> {
     const TERMINATORS: &[char] = &['。', '！', '？', '．', '!', '?', '.', ',', '、'];
     const FINALIZE_THRESHOLD_MS: i64 = 1_500;
 
@@ -175,10 +174,7 @@ pub fn spawn_transcription_worker(
                         }
                     }
 
-                    for (session_id, (audio, language, is_final)) in latest_requests {
-                        if sessions_with_final.contains(&session_id) {
-                            continue;
-                        }
+                    for (audio, language, _session_id, is_final) in final_requests {
                         if let Err(err) =
                             transcribe_and_emit(&audio, language.clone(), is_final, &app_handle)
                         {
@@ -186,7 +182,10 @@ pub fn spawn_transcription_worker(
                         }
                     }
 
-                    for (audio, language, _session_id, is_final) in final_requests {
+                    for (session_id, (audio, language, is_final)) in latest_requests {
+                        if sessions_with_final.contains(&session_id) {
+                            continue;
+                        }
                         if let Err(err) =
                             transcribe_and_emit(&audio, language.clone(), is_final, &app_handle)
                         {
@@ -209,8 +208,9 @@ pub fn transcribe_and_emit_common(
     is_final: bool,
     app_handle: &AppHandle,
     source: &str,
-    on_session_rotate: Option<&dyn Fn(u64)>,
-) -> Result<Option<i64>, String> {
+    message_id_counter: u64,
+    transcribed_samples: usize,
+) -> Result<(usize, u64), String> {
     let ctx_lock = WHISPER_CTX
         .get()
         .ok_or_else(|| "Whisper not initialized".to_string())?
@@ -220,31 +220,50 @@ pub fn transcribe_and_emit_common(
         .as_ref()
         .ok_or_else(|| "Whisper context not available".to_string())?;
 
-    let session_id = format!("{}_{}", session_id_prefix, session_id_counter);
+    let mut next_message_id = message_id_counter;
+
+    // Skip already transcribed samples
+    if transcribed_samples >= audio_data.len() {
+        debug!(
+            "[transcribe_and_emit_common] Skipping transcription: already transcribed {} samples, audio length {}",
+            transcribed_samples,
+            audio_data.len()
+        );
+        return Ok((transcribed_samples, next_message_id));
+    }
+
+    let audio_to_transcribe = &audio_data[transcribed_samples..];
+    debug!(
+        "[transcribe_and_emit_common] Transcribing from sample {} to {}, total {} samples",
+        transcribed_samples,
+        audio_data.len(),
+        audio_to_transcribe.len()
+    );
 
     if is_final {
         let text = ctx
-            .transcribe_with_language(audio_data, language)
+            .transcribe_with_language(audio_to_transcribe, language)
             .map_err(|e| e.to_string())?;
-
-        if let Some(callback) = on_session_rotate {
-            callback(session_id_counter + 1);
-        }
 
         emit_transcription_segment(
             app_handle,
             text,
-            Some(audio_data.to_vec()),
-            session_id,
+            Some(audio_to_transcribe.to_vec()),
+            format!(
+                "{}_{}_{}",
+                session_id_prefix, session_id_counter, next_message_id
+            ),
             is_final,
             source.to_string(),
         )?;
 
-        return Ok(None);
+        next_message_id = next_message_id.wrapping_add(1);
+
+        return Ok((audio_data.len(), next_message_id));
     }
 
     let segments = ctx
-        .transcribe_segments_with_language(audio_data, language)
+        .transcribe_segments_with_language(audio_to_transcribe, language)
         .map_err(|e| e.to_string())?;
 
     let prepared_segments = split_segments_on_punctuation(&segments);
@@ -254,21 +273,28 @@ pub fn transcribe_and_emit_common(
         segments.len()
     );
 
-    let mut finalized_cutoff_ms: Option<i64> = None;
     let total_segments = prepared_segments.len();
-    let mut current_session_id = session_id.clone();
-    let mut current_counter = session_id_counter;
+    let mut new_transcribed_samples = transcribed_samples;
 
     for (idx, segment) in prepared_segments.iter().enumerate() {
+        let segment_is_final = total_segments > 0 && idx + 1 != total_segments;
+
+        // Calculate absolute sample position in the original audio
+        let segment_start_samples = transcribed_samples + ((segment.start_ms * VAD_SAMPLE_RATE as i64) / 1000) as usize;
+        let segment_end_samples = transcribed_samples + ((segment.end_ms * VAD_SAMPLE_RATE as i64) / 1000) as usize;
+
         debug!(
-            "[transcribe_and_emit_common] Emitting segment #{}: {}ms - {}ms, text=\"{}\"",
+            "[transcribe_and_emit_common] Emitting segment #{}: {}ms - {}ms (samples {} - {}), text=\"{}\", is_final={}",
             idx,
             segment.start_ms,
             segment.end_ms,
-            segment.text.replace('\n', " ")
+            segment_start_samples,
+            segment_end_samples,
+            segment.text.replace('\n', " "),
+            segment_is_final
         );
-        let segment_audio = slice_audio_segment(audio_data, segment.start_ms, segment.end_ms);
-        let segment_is_final = total_segments > 0 && idx + 1 != total_segments;
+
+        let segment_audio = slice_audio_segment(audio_to_transcribe, segment.start_ms, segment.end_ms);
 
         if let Err(err) = emit_transcription_segment(
             app_handle,
@@ -278,7 +304,10 @@ pub fn transcribe_and_emit_common(
             } else {
                 Some(segment_audio)
             },
-            current_session_id.clone(),
+            format!(
+                "{}_{}_{}",
+                session_id_prefix, session_id_counter, next_message_id
+            ),
             segment_is_final,
             source.to_string(),
         ) {
@@ -286,23 +315,17 @@ pub fn transcribe_and_emit_common(
         }
 
         if segment_is_final {
-            finalized_cutoff_ms = Some(
-                finalized_cutoff_ms.map_or(segment.end_ms, |cutoff| cutoff.max(segment.end_ms)),
-            );
-
-            current_counter += 1;
-            if let Some(callback) = on_session_rotate {
-                callback(current_counter);
-            }
-            current_session_id = format!("{}_{}", session_id_prefix, current_counter);
+            // Update transcribed samples to the end of this finalized segment
+            new_transcribed_samples = segment_end_samples;
+            next_message_id = next_message_id.wrapping_add(1);
             debug!(
-                "[transcribe_and_emit_common] Rotated session_id to: {}",
-                current_session_id
+                "[transcribe_and_emit_common] Updated transcribed_samples to {}",
+                new_transcribed_samples
             );
         }
     }
 
-    Ok(finalized_cutoff_ms)
+    Ok((new_transcribed_samples, next_message_id))
 }
 
 fn transcribe_and_emit(
@@ -314,15 +337,17 @@ fn transcribe_and_emit(
     let state =
         try_recording_state().ok_or_else(|| "Recording state not initialized".to_string())?;
 
-    let (session_id_counter, lang) = {
+    let (session_id_counter, lang, transcribed_samples, message_id_counter) = {
         let state_guard = state.lock();
         (
             state_guard.session_id_counter,
             language.as_deref().unwrap_or("ja").to_string(),
+            state_guard.transcribed_samples,
+            state_guard.message_id_counter,
         )
     };
 
-    let finalized_cutoff_ms = transcribe_and_emit_common(
+    let (new_transcribed_samples, next_message_id) = transcribe_and_emit_common(
         audio_data,
         &lang,
         "mic",
@@ -330,25 +355,27 @@ fn transcribe_and_emit(
         is_final,
         app_handle,
         "user",
-        Some(&|new_counter| {
-            if let Some(state) = try_recording_state() {
-                let mut state_guard = state.lock();
-                state_guard.session_id_counter = new_counter;
-            }
-        }),
+        message_id_counter,
+        transcribed_samples,
     )?;
 
-    if let Some(cutoff_ms) = finalized_cutoff_ms {
-        let cutoff_samples = ((cutoff_ms.max(0) * VAD_SAMPLE_RATE as i64) / 1000) as usize;
-        let cutoff_samples = cutoff_samples.min(audio_data.len());
-        if cutoff_samples > 0 {
-            trim_session_audio_samples(cutoff_samples);
+    // Update transcribed samples and message id in state
+    {
+        let mut state_guard = state.lock();
+
+
+        if is_final {
+            state_guard.session_id_counter += 1;
+            state_guard.message_id_counter = 0;
+            state_guard.transcribed_samples = 0;
+        } else {
+            state_guard.transcribed_samples = new_transcribed_samples;
+            state_guard.message_id_counter = next_message_id;
         }
     }
 
     Ok(())
 }
-
 
 pub fn queue_transcription_with_source(
     audio: Vec<f32>,

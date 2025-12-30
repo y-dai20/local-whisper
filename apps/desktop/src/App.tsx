@@ -402,6 +402,9 @@ function App() {
       "transcription-segment",
       (event) => {
         const segment = event.payload;
+
+        console.log("[App] Received transcription segment:", segment);
+
         setTranscriptions((prev) => {
           const existingIndex = prev.findIndex(
             (s) => s.sessionId === segment.sessionId

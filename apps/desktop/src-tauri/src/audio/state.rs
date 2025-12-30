@@ -50,6 +50,8 @@ pub struct RecordingState {
     pub current_recording_dir: Option<String>,
     pub last_vad_event_time: Instant,
     pub session_max_samples: usize,
+    pub transcribed_samples: usize,
+    pub message_id_counter: u64,
 }
 
 pub fn default_recording_state() -> RecordingState {
@@ -79,6 +81,8 @@ pub fn default_recording_state() -> RecordingState {
         current_recording_dir: None,
         last_vad_event_time: Instant::now(),
         session_max_samples: calculate_session_max_samples(default_params.audio_ctx),
+        transcribed_samples: 0,
+        message_id_counter: 0,
     }
 }
 

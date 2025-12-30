@@ -3,7 +3,7 @@ use crate::audio::{
     VAD_CHUNK_SIZE, VAD_SAMPLE_RATE,
 };
 use std::ptr::{addr_of, addr_of_mut};
-use log::{error, info, debug};
+use log::{error, info};
 use parking_lot::Mutex as ParkingMutex;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +28,8 @@ struct SystemAudioSession {
     partial_transcript_interval_samples: usize,
     last_vad_event_time: std::time::Instant,
     is_voice_active: bool,
+    transcribed_samples: usize,
+    message_id_counter: u64,
 }
 
 static mut SYSTEM_AUDIO_SESSION: Option<SystemAudioSession> = None;
@@ -184,7 +186,7 @@ fn finalize_system_audio_session(
     app_handle: Option<&AppHandle>,
     language: Option<&str>,
 ) {
-    if session.session_id_counter == 0 || session.session_audio.is_empty() {
+    if session.session_audio.is_empty() {
         session.session_audio.clear();
         session.session_samples = 0;
         session.last_partial_emit_samples = 0;
@@ -228,7 +230,16 @@ fn transcribe_system_audio(
     is_final: bool,
     app_handle: &AppHandle,
 ) -> Result<(), String> {
-    let finalized_cutoff_ms = super::transcribe_and_emit_common(
+    let (transcribed_samples, message_id_counter) = unsafe {
+        let session_ptr = addr_of!(SYSTEM_AUDIO_SESSION);
+        if let Some(session) = (*session_ptr).as_ref() {
+            (session.transcribed_samples, session.message_id_counter)
+        } else {
+            (0, 0)
+        }
+    };
+
+    let (new_transcribed_samples, next_message_id) = super::transcribe_and_emit_common(
         audio_data,
         language,
         "system",
@@ -236,56 +247,27 @@ fn transcribe_system_audio(
         is_final,
         app_handle,
         "system",
-        Some(&|new_counter| unsafe {
-            let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
-            if let Some(session) = (*session_ptr).as_mut() {
-                session.session_id_counter = new_counter;
-            }
-        }),
+        message_id_counter,
+        transcribed_samples,
     )?;
 
-    if let Some(cutoff_ms) = finalized_cutoff_ms {
-        let cutoff_samples = ((cutoff_ms.max(0) * VAD_SAMPLE_RATE as i64) / 1000) as usize;
-        trim_system_session_audio_samples(cutoff_samples);
+    // Update transcribed samples
+    unsafe {
+        let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
+        if let Some(session) = (*session_ptr).as_mut() {
+
+            if is_final {
+                session.session_id_counter += 1;
+                session.message_id_counter = 0;
+                session.transcribed_samples = 0;
+            } else {
+                session.transcribed_samples = new_transcribed_samples;
+                session.message_id_counter = next_message_id;
+            }
+        }
     }
 
     Ok(())
-}
-
-fn trim_system_session_audio_samples(cutoff_samples: usize) {
-    if cutoff_samples == 0 {
-        return;
-    }
-
-    unsafe {
-        let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
-        let Some(session) = (*session_ptr).as_mut() else {
-            return;
-        };
-
-        if session.session_audio.is_empty() {
-            return;
-        }
-
-        let trim = cutoff_samples.min(session.session_audio.len());
-        if trim == 0 {
-            return;
-        }
-
-        session.session_audio.drain(0..trim);
-        session.session_samples = session.session_samples.saturating_sub(trim);
-        session.last_partial_emit_samples =
-            session.last_partial_emit_samples.saturating_sub(trim);
-        if let Some(last_voice) = session.last_voice_sample {
-            session.last_voice_sample = last_voice.checked_sub(trim);
-        }
-
-        debug!(
-            "[trim_system_session_audio_samples] Trimmed {} samples, remaining session_audio: {} samples",
-            trim,
-            session.session_audio.len()
-        );
-    }
 }
 
 pub fn start_system_audio_capture(
@@ -316,6 +298,8 @@ pub fn start_system_audio_capture(
             partial_transcript_interval_samples: partial_interval,
             last_vad_event_time: std::time::Instant::now(),
             is_voice_active: false,
+            transcribed_samples: 0,
+            message_id_counter: 0,
         });
 
         APP_HANDLE = Some(app_handle);

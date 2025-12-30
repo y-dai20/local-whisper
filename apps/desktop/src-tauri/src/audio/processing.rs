@@ -7,7 +7,7 @@ use log::{debug, error, info};
 use super::constants::{
     VAD_CHUNK_SIZE, VAD_POST_BUFFER_SAMPLES, VAD_PRE_BUFFER_SAMPLES, VAD_SAMPLE_RATE,
 };
-use super::state::{recording_state, RecordingState, SileroVadState};
+use crate::audio::state::{RecordingState, SileroVadState};
 use crate::emit_voice_activity_event;
 use crate::transcription::worker::queue_transcription;
 
@@ -80,43 +80,6 @@ pub fn finalize_active_session(state: &mut RecordingState, reason: &str) {
     state.session_samples = 0;
     state.last_partial_emit_samples = 0;
     state.last_voice_sample = None;
-}
-
-pub fn trim_session_audio_samples(cutoff_samples: usize) {
-    if cutoff_samples == 0 {
-        return;
-    }
-
-    let state = recording_state();
-    let mut state_guard = state.lock();
-    if state_guard.session_audio.is_empty() {
-        return;
-    }
-
-    let trim = cutoff_samples.min(state_guard.session_audio.len());
-    if trim == 0 {
-        return;
-    }
-
-    state_guard.session_audio.drain(0..trim);
-    if trim >= state_guard.audio_buffer.len() {
-        state_guard.audio_buffer.clear();
-    } else {
-        state_guard.audio_buffer.drain(0..trim);
-    }
-
-    state_guard.session_samples = state_guard.session_samples.saturating_sub(trim);
-    state_guard.last_partial_emit_samples =
-        state_guard.last_partial_emit_samples.saturating_sub(trim);
-    if let Some(last_voice) = state_guard.last_voice_sample {
-        state_guard.last_voice_sample = last_voice.checked_sub(trim);
-    }
-
-    debug!(
-        "[trim_mic_session_audio_samples] Trimmed {} samples, remaining session_audio: {} samples",
-        trim,
-        state_guard.session_audio.len()
-    );
 }
 
 fn process_vad_chunk_only(
