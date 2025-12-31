@@ -1,7 +1,8 @@
 use crate::audio::{
-    try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES,
-    VAD_CHUNK_SIZE, VAD_SAMPLE_RATE,
+    try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES, VAD_CHUNK_SIZE, VAD_SAMPLE_RATE,
 };
+use crate::transcription::worker::queue_transcription_with_source;
+use crate::transcription::{spawn_transcription_worker, TranscriptionSource};
 use std::ptr::{addr_of, addr_of_mut};
 use log::{error, info};
 use parking_lot::Mutex as ParkingMutex;
@@ -24,12 +25,9 @@ struct SystemAudioSession {
     session_samples: usize,
     last_voice_sample: Option<usize>,
     last_partial_emit_samples: usize,
-    session_id_counter: u64,
     partial_transcript_interval_samples: usize,
     last_vad_event_time: std::time::Instant,
     is_voice_active: bool,
-    transcribed_samples: usize,
-    message_id_counter: u64,
 }
 
 static mut SYSTEM_AUDIO_SESSION: Option<SystemAudioSession> = None;
@@ -164,20 +162,40 @@ fn queue_system_audio_transcription(
     if session.session_audio.is_empty() {
         return;
     }
-    let Some(app) = app_handle else {
-        return;
-    };
+    unsafe {
+        let state_ptr = addr_of!(RECORDING_STATE);
+        let Some(state_arc) = (*state_ptr).as_ref() else {
+            return;
+        };
+        let state_guard = state_arc.lock();
+        let Some(tx) = state_guard.transcription_tx.as_ref() else {
+            error!("Transcription worker not running; cannot queue system transcription");
+            return;
+        };
 
-    let audio = session.session_audio.clone();
-    let lang = language.unwrap_or("ja").to_string();
-    let app_clone = app.clone();
-    let session_id = session.session_id_counter;
+        let audio = session.session_audio.clone();
+        let language = language
+            .map(|s| s.to_string())
+            .or_else(|| state_guard.language.clone())
+            .or_else(|| Some("ja".to_string()));
+        let session_id_counter = state_guard
+            .transcription_state(TranscriptionSource::System)
+            .session_id_counter;
 
-    std::thread::spawn(move || {
-        if let Err(e) = transcribe_system_audio(&audio, &lang, session_id, is_final, &app_clone) {
-            error!("System audio transcription error: {}", e);
+        queue_transcription_with_source(
+            audio,
+            language,
+            session_id_counter,
+            TranscriptionSource::System,
+            is_final,
+            tx,
+        );
+
+        if let Some(app) = app_handle {
+            drop(state_guard);
+            super::emit_voice_activity_event(app, "system", session.is_voice_active);
         }
-    });
+    }
 }
 
 fn finalize_system_audio_session(
@@ -203,11 +221,14 @@ fn finalize_system_audio_session(
             let save_enabled = state.recording_save_enabled;
             let recording_dir = state.current_recording_dir.clone();
             let is_recording = state.is_recording;
+            let session_id_counter = state
+                .transcription_state(TranscriptionSource::System)
+                .session_id_counter;
             drop(state);
 
             crate::audio::finalize_session_common(
                 &session.session_audio,
-                session.session_id_counter,
+                session_id_counter,
                 reason,
                 "system",
                 save_enabled,
@@ -223,62 +244,25 @@ fn finalize_system_audio_session(
     session.last_voice_sample = None;
 }
 
-fn transcribe_system_audio(
-    audio_data: &[f32],
-    language: &str,
-    session_id: u64,
-    is_final: bool,
-    app_handle: &AppHandle,
-) -> Result<(), String> {
-    let (transcribed_samples, message_id_counter) = unsafe {
-        let session_ptr = addr_of!(SYSTEM_AUDIO_SESSION);
-        if let Some(session) = (*session_ptr).as_ref() {
-            (session.transcribed_samples, session.message_id_counter)
-        } else {
-            (0, 0)
-        }
-    };
-
-    let (new_transcribed_samples, next_message_id) = super::transcribe_and_emit_common(
-        audio_data,
-        language,
-        "system",
-        session_id,
-        is_final,
-        app_handle,
-        "system",
-        message_id_counter,
-        transcribed_samples,
-    )?;
-
-    // Update transcribed samples
-    unsafe {
-        let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
-        if let Some(session) = (*session_ptr).as_mut() {
-
-            if is_final {
-                session.session_id_counter += 1;
-                session.message_id_counter = 0;
-                session.transcribed_samples = 0;
-            } else {
-                session.transcribed_samples = new_transcribed_samples;
-                session.message_id_counter = next_message_id;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 pub fn start_system_audio_capture(
     state: Arc<ParkingMutex<RecordingState>>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
     unsafe {
-        let state_guard = state.lock();
-        let vad_threshold = state_guard.vad_threshold;
-        let partial_interval = state_guard.partial_transcript_interval_samples;
-        drop(state_guard);
+        let (vad_threshold, partial_interval) = {
+            let mut state_guard = state.lock();
+
+            if state_guard.transcription_tx.is_none() {
+                let (tx, handle) = spawn_transcription_worker(app_handle.clone());
+                state_guard.transcription_tx = Some(tx);
+                state_guard.transcription_handle = Some(handle);
+            }
+
+            (
+                state_guard.vad_threshold,
+                state_guard.partial_transcript_interval_samples,
+            )
+        };
 
         let vad = VoiceActivityDetector::builder()
             .sample_rate(16000)
@@ -294,12 +278,9 @@ pub fn start_system_audio_capture(
             session_samples: 0,
             last_voice_sample: None,
             last_partial_emit_samples: 0,
-            session_id_counter: 0,
             partial_transcript_interval_samples: partial_interval,
             last_vad_event_time: std::time::Instant::now(),
             is_voice_active: false,
-            transcribed_samples: 0,
-            message_id_counter: 0,
         });
 
         APP_HANDLE = Some(app_handle);

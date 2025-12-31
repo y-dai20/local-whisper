@@ -6,13 +6,12 @@ use std::thread::{self, JoinHandle};
 use tauri::AppHandle;
 use std::sync::mpsc::Sender;
 
-use crate::audio::state::RecordingState;
 use crate::audio::constants::VAD_SAMPLE_RATE;
-use crate::audio::state::try_recording_state;
+use crate::audio::state::{try_recording_state, RecordingState};
 use crate::emit_transcription_segment;
 use crate::whisper::WHISPER_CTX;
 
-use super::TranscriptionCommand;
+use super::{TranscriptionCommand, TranscriptionSource};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedSegment {
@@ -142,53 +141,70 @@ pub fn spawn_transcription_worker(
                 TranscriptionCommand::Run {
                     audio,
                     language,
-                    session_id,
+                    source,
+                    session_id_counter,
                     is_final,
                 } => {
-                    let mut all_commands = vec![(audio, language, session_id, is_final)];
+                    let mut all_commands =
+                        vec![(audio, language, source, session_id_counter, is_final)];
                     while let Ok(next_command) = rx.try_recv() {
                         match next_command {
                             TranscriptionCommand::Run {
                                 audio: a,
                                 language: l,
-                                session_id: s,
+                                source: src,
+                                session_id_counter: sid,
                                 is_final: f,
                             } => {
-                                all_commands.push((a, l, s, f));
+                                all_commands.push((a, l, src, sid, f));
                             }
                             TranscriptionCommand::Stop => return,
                         }
                     }
 
-                    let mut latest_requests: HashMap<String, (Vec<f32>, Option<String>, bool)> =
-                        HashMap::new();
+                    let mut latest_requests: HashMap<
+                        (TranscriptionSource, u64),
+                        (Vec<f32>, Option<String>, bool),
+                    > = HashMap::new();
                     let mut final_requests = Vec::new();
                     let mut sessions_with_final = HashSet::new();
 
-                    for (audio, language, session_id, is_final) in all_commands {
+                    for (audio, language, source, session_id_counter, is_final) in all_commands {
+                        let key = (source, session_id_counter);
                         if is_final {
-                            sessions_with_final.insert(session_id.clone());
-                            final_requests.push((audio, language, session_id, is_final));
+                            sessions_with_final.insert(key);
+                            final_requests.push((audio, language, source, session_id_counter));
                         } else {
-                            latest_requests.insert(session_id, (audio, language, is_final));
+                            latest_requests.insert(key, (audio, language, is_final));
                         }
                     }
 
-                    for (audio, language, _session_id, is_final) in final_requests {
-                        if let Err(err) =
-                            transcribe_and_emit(&audio, language.clone(), is_final, &app_handle)
-                        {
+                    for (audio, language, source, session_id_counter) in final_requests {
+                        if let Err(err) = transcribe_and_emit(
+                            &audio,
+                            language.clone(),
+                            source,
+                            session_id_counter,
+                            true,
+                            &app_handle,
+                        ) {
                             error!("Transcription worker error: {}", err);
                         }
                     }
 
-                    for (session_id, (audio, language, is_final)) in latest_requests {
-                        if sessions_with_final.contains(&session_id) {
+                    for (key, (audio, language, is_final)) in latest_requests {
+                        if sessions_with_final.contains(&key) {
                             continue;
                         }
-                        if let Err(err) =
-                            transcribe_and_emit(&audio, language.clone(), is_final, &app_handle)
-                        {
+                        let (source, session_id_counter) = key;
+                        if let Err(err) = transcribe_and_emit(
+                            &audio,
+                            language.clone(),
+                            source,
+                            session_id_counter,
+                            is_final,
+                            &app_handle,
+                        ) {
                             error!("Transcription worker error: {}", err);
                         }
                     }
@@ -331,46 +347,48 @@ pub fn transcribe_and_emit_common(
 fn transcribe_and_emit(
     audio_data: &[f32],
     language: Option<String>,
+    source: TranscriptionSource,
+    session_id_counter: u64,
     is_final: bool,
     app_handle: &AppHandle,
 ) -> Result<(), String> {
     let state =
         try_recording_state().ok_or_else(|| "Recording state not initialized".to_string())?;
 
-    let (session_id_counter, lang, transcribed_samples, message_id_counter) = {
+    let (lang, source_state) = {
         let state_guard = state.lock();
-        (
-            state_guard.session_id_counter,
-            language.as_deref().unwrap_or("ja").to_string(),
-            state_guard.transcribed_samples,
-            state_guard.message_id_counter,
-        )
+        let lang = language
+            .clone()
+            .or_else(|| state_guard.language.clone())
+            .unwrap_or_else(|| "ja".to_string());
+        let source_state = state_guard.transcription_state(source).clone();
+        (lang, source_state)
     };
 
     let (new_transcribed_samples, next_message_id) = transcribe_and_emit_common(
         audio_data,
         &lang,
-        "mic",
+        source.session_prefix(),
         session_id_counter,
         is_final,
         app_handle,
-        "user",
-        message_id_counter,
-        transcribed_samples,
+        source.event_source(),
+        source_state.message_id_counter,
+        source_state.transcribed_samples,
     )?;
 
-    // Update transcribed samples and message id in state
     {
         let mut state_guard = state.lock();
-
+        let source_state_mut = state_guard.transcription_state_mut(source);
 
         if is_final {
-            state_guard.session_id_counter += 1;
-            state_guard.message_id_counter = 0;
-            state_guard.transcribed_samples = 0;
+            source_state_mut.session_id_counter =
+                source_state_mut.session_id_counter.wrapping_add(1);
+            source_state_mut.message_id_counter = 0;
+            source_state_mut.transcribed_samples = 0;
         } else {
-            state_guard.transcribed_samples = new_transcribed_samples;
-            state_guard.message_id_counter = next_message_id;
+            source_state_mut.transcribed_samples = new_transcribed_samples;
+            source_state_mut.message_id_counter = next_message_id;
         }
     }
 
@@ -381,7 +399,7 @@ pub fn queue_transcription_with_source(
     audio: Vec<f32>,
     language: Option<String>,
     session_id_counter: u64,
-    source_prefix: &str,
+    source: TranscriptionSource,
     is_final: bool,
     tx: &Sender<TranscriptionCommand>,
 ) {
@@ -389,13 +407,12 @@ pub fn queue_transcription_with_source(
         return;
     }
 
-    let session_id_str = format!("{}_{}", source_prefix, session_id_counter);
-
     if tx
         .send(TranscriptionCommand::Run {
             audio,
             language,
-            session_id: session_id_str,
+            source,
+            session_id_counter,
             is_final,
         })
         .is_err()
@@ -412,11 +429,15 @@ pub fn queue_transcription(state: &RecordingState, is_final: bool) {
         return;
     };
 
+    let session_id_counter = state
+        .transcription_state(TranscriptionSource::Mic)
+        .session_id_counter;
+
     queue_transcription_with_source(
         state.session_audio.clone(),
         state.language.clone(),
-        state.session_id_counter,
-        "mic",
+        session_id_counter,
+        TranscriptionSource::Mic,
         is_final,
         tx,
     );

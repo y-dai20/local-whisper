@@ -7,7 +7,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::Mutex as ParkingMutex;
 use voice_activity_detector::VoiceActivityDetector;
 
-use crate::transcription::TranscriptionCommand;
+use crate::transcription::{TranscriptionCommand, TranscriptionSource};
 
 use super::constants::{
     calculate_session_max_samples, DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES,
@@ -24,6 +24,13 @@ pub struct SileroVadState {
     pub is_voice_active: bool,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct SourceTranscriptionState {
+    pub session_id_counter: u64,
+    pub transcribed_samples: usize,
+    pub message_id_counter: u64,
+}
+
 #[derive(Debug)]
 pub struct RecordingState {
     pub is_recording: bool,
@@ -37,7 +44,6 @@ pub struct RecordingState {
     pub session_samples: usize,
     pub last_voice_sample: Option<usize>,
     pub last_partial_emit_samples: usize,
-    pub session_id_counter: u64,
     pub transcription_tx: Option<mpsc::Sender<TranscriptionCommand>>,
     pub transcription_handle: Option<JoinHandle<()>>,
     pub language: Option<String>,
@@ -50,8 +56,8 @@ pub struct RecordingState {
     pub current_recording_dir: Option<String>,
     pub last_vad_event_time: Instant,
     pub session_max_samples: usize,
-    pub transcribed_samples: usize,
-    pub message_id_counter: u64,
+    pub mic_transcription: SourceTranscriptionState,
+    pub system_transcription: SourceTranscriptionState,
 }
 
 pub fn default_recording_state() -> RecordingState {
@@ -68,7 +74,6 @@ pub fn default_recording_state() -> RecordingState {
         session_samples: 0,
         last_voice_sample: None,
         last_partial_emit_samples: 0,
-        session_id_counter: 0,
         transcription_tx: None,
         transcription_handle: None,
         language: None,
@@ -81,8 +86,30 @@ pub fn default_recording_state() -> RecordingState {
         current_recording_dir: None,
         last_vad_event_time: Instant::now(),
         session_max_samples: calculate_session_max_samples(default_params.audio_ctx),
-        transcribed_samples: 0,
-        message_id_counter: 0,
+        mic_transcription: SourceTranscriptionState::default(),
+        system_transcription: SourceTranscriptionState::default(),
+    }
+}
+
+impl RecordingState {
+    pub fn transcription_state(
+        &self,
+        source: TranscriptionSource,
+    ) -> &SourceTranscriptionState {
+        match source {
+            TranscriptionSource::Mic => &self.mic_transcription,
+            TranscriptionSource::System => &self.system_transcription,
+        }
+    }
+
+    pub fn transcription_state_mut(
+        &mut self,
+        source: TranscriptionSource,
+    ) -> &mut SourceTranscriptionState {
+        match source {
+            TranscriptionSource::Mic => &mut self.mic_transcription,
+            TranscriptionSource::System => &mut self.system_transcription,
+        }
     }
 }
 

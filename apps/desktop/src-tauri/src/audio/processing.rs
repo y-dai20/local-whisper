@@ -9,7 +9,7 @@ use super::constants::{
 };
 use crate::audio::state::{RecordingState, SileroVadState};
 use crate::emit_voice_activity_event;
-use crate::transcription::worker::queue_transcription;
+use crate::transcription::{worker::queue_transcription, TranscriptionSource};
 
 pub fn finalize_session_common(
     audio: &[f32],
@@ -64,9 +64,13 @@ pub fn finalize_active_session(state: &mut RecordingState, reason: &str) {
         return;
     }
 
+    let session_id_counter = state
+        .transcription_state(TranscriptionSource::Mic)
+        .session_id_counter;
+
     finalize_session_common(
         &state.session_audio,
-        state.session_id_counter,
+        session_id_counter,
         reason,
         "mic",
         state.recording_save_enabled,
