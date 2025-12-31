@@ -65,7 +65,6 @@ interface WhisperParamsConfig {
 function App() {
   const [isMuted, setIsMuted] = useState(true);
   const [isInitialized, setIsInitialized] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [selectedLanguage, setSelectedLanguage] = useState<string>("ja");
@@ -650,7 +649,6 @@ function App() {
 
   const stopMic = async () => {
     setIsMuted(true);
-    setIsTranscribing(true);
 
     try {
       await invoke("stop_mic");
@@ -659,8 +657,6 @@ function App() {
       setError(
         `録音停止エラー: ${err instanceof Error ? err.message : String(err)}`
       );
-    } finally {
-      setIsTranscribing(false);
     }
   };
 
@@ -750,14 +746,14 @@ function App() {
           <div className="join">
             <button
               className={`join-item btn btn-sm ${
-                !isInitialized || isTranscribing
+                !isInitialized
                   ? "btn-disabled"
                   : isMuted
                   ? "btn-ghost"
                   : "btn-primary"
               }`}
               onClick={toggleMute}
-              disabled={!isInitialized || isTranscribing}
+              disabled={!isInitialized}
               title={isMuted ? "マイクON" : "マイクOFF"}
             >
               {isMuted ? (
@@ -888,13 +884,6 @@ function App() {
                   </div>
                 )}
               <div ref={messagesEndRef} />
-            </div>
-          )}
-
-          {isTranscribing && (
-            <div className="flex items-center justify-center gap-3 py-4">
-              <span className="loading loading-spinner loading-md"></span>
-              <span className="text-sm">文字起こし中...</span>
             </div>
           )}
         </div>
