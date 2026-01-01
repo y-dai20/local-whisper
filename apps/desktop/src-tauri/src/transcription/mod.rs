@@ -45,7 +45,9 @@ pub struct TranscriptionSegment {
     #[serde(rename = "audioData")]
     pub audio_data: Option<Vec<f32>>,
     #[serde(rename = "sessionId")]
-    pub session_id: String,
+    pub session_id: u64,
+    #[serde(rename = "messageId")]
+    pub message_id: u64,
     #[serde(rename = "isFinal")]
     pub is_final: bool,
     pub source: String,

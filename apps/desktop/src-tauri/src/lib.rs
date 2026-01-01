@@ -37,7 +37,8 @@ pub(crate) fn emit_transcription_segment(
     app_handle: &AppHandle,
     text: String,
     audio_data: Option<Vec<f32>>,
-    session_id: String,
+    session_id: u64,
+    message_id: u64,
     is_final: bool,
     source: String,
 ) -> Result<(), String> {
@@ -58,6 +59,7 @@ pub(crate) fn emit_transcription_segment(
             .as_secs(),
         audio_data,
         session_id: session_id.clone(),
+        message_id: message_id.clone(),
         is_final,
         source: source.clone(),
     };
@@ -87,7 +89,7 @@ pub(crate) fn emit_transcription_segment(
 fn save_transcription_to_txt(
     recording_dir: &str,
     text: &str,
-    session_id: &str,
+    session_id: &u64,
     source: &str,
 ) -> Result<(), String> {
     use std::fs::OpenOptions;

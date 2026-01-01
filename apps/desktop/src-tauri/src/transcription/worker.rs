@@ -265,10 +265,8 @@ pub fn transcribe_and_emit_common(
             app_handle,
             text,
             Some(audio_to_transcribe.to_vec()),
-            format!(
-                "{}_{}_{}",
-                session_id_prefix, session_id_counter, next_message_id
-            ),
+            session_id_counter,
+            next_message_id,
             is_final,
             source.to_string(),
         )?;
@@ -320,10 +318,8 @@ pub fn transcribe_and_emit_common(
             } else {
                 Some(segment_audio)
             },
-            format!(
-                "{}_{}_{}",
-                session_id_prefix, session_id_counter, next_message_id
-            ),
+            session_id_counter,
+            next_message_id,
             segment_is_final,
             source.to_string(),
         ) {

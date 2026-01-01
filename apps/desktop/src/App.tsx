@@ -20,9 +20,18 @@ interface TranscriptionSegment {
   text: string;
   timestamp: number;
   audioData?: number[];
-  sessionId: string;
+  sessionId: number;
+  messageId: number;
   isFinal: boolean;
   source: string;
+}
+
+interface SessionTranscription {
+  sessionKey: string;
+  sessionId: number;
+  source: string;
+  messages: TranscriptionSegment[];
+  audioChunks: Record<number, number[]>;
 }
 
 interface ModelInfo {
@@ -71,11 +80,13 @@ function App() {
   const [availableLanguages, setAvailableLanguages] = useState<
     [string, string][]
   >([]);
-  const [transcriptions, setTranscriptions] = useState<TranscriptionSegment[]>(
+  const [transcriptions, setTranscriptions] = useState<SessionTranscription[]>(
     []
   );
   const [error, setError] = useState("");
-  const [playingIndex, setPlayingIndex] = useState<number | null>(null);
+  const [playingSessionKey, setPlayingSessionKey] = useState<string | null>(
+    null
+  );
   const [currentAudioSource, setCurrentAudioSource] =
     useState<AudioBufferSourceNode | null>(null);
   const [currentAudioContext, setCurrentAudioContext] =
@@ -215,7 +226,7 @@ function App() {
 
       // 既存の文字起こし履歴をクリアして新しい録画用にリセット
       setTranscriptions([]);
-      setPlayingIndex(null);
+      setPlayingSessionKey(null);
       if (currentAudioSource) {
         currentAudioSource.stop();
         currentAudioSource.disconnect();
@@ -405,17 +416,63 @@ function App() {
         console.log("[App] Received transcription segment:", segment);
 
         setTranscriptions((prev) => {
-          const existingIndex = prev.findIndex(
-            (s) => s.sessionId === segment.sessionId
+          const sessionKey = `${segment.source}-${segment.sessionId}`;
+          const sessions = [...prev];
+          const sessionIndex = sessions.findIndex(
+            (s) => s.sessionKey === sessionKey
           );
 
-          if (existingIndex >= 0) {
-            const updated = [...prev];
-            updated[existingIndex] = segment;
-            return updated;
-          } else {
-            return [...prev, segment];
+          const upsertMessages = (
+            existing: TranscriptionSegment[] | undefined
+          ) => {
+            if (!existing) {
+              return [segment];
+            }
+            const messages = [...existing];
+            const messageIndex = messages.findIndex(
+              (m) => m.messageId === segment.messageId
+            );
+            if (messageIndex >= 0) {
+              messages[messageIndex] = segment;
+            } else {
+              messages.push(segment);
+            }
+            messages.sort((a, b) => a.messageId - b.messageId);
+            return messages;
+          };
+
+          const upsertAudioChunks = (
+            existing: Record<number, number[]> | undefined
+          ) => {
+            const chunks = { ...(existing || {}) };
+            if (segment.audioData?.length) {
+              chunks[segment.messageId] = segment.audioData;
+            }
+            return chunks;
+          };
+
+          if (sessionIndex >= 0) {
+            const session = sessions[sessionIndex];
+            sessions[sessionIndex] = {
+              ...session,
+              messages: upsertMessages(session.messages),
+              audioChunks: upsertAudioChunks(session.audioChunks),
+            };
+            return sessions;
           }
+
+          return [
+            ...sessions,
+            {
+              sessionKey,
+              sessionId: segment.sessionId,
+              source: segment.source,
+              messages: [segment],
+              audioChunks: segment.audioData?.length
+                ? { [segment.messageId]: segment.audioData }
+                : {},
+            },
+          ];
         });
       }
     );
@@ -670,12 +727,15 @@ function App() {
       currentAudioContext.close();
       setCurrentAudioContext(null);
     }
-    setPlayingIndex(null);
+    setPlayingSessionKey(null);
   };
 
-  const playAudio = (audioData: number[], index: number) => {
+  const playSessionAudio = (audioData: number[], sessionKey: string) => {
+    if (audioData.length === 0) {
+      return;
+    }
     try {
-      if (playingIndex === index) {
+      if (playingSessionKey === sessionKey) {
         stopAudio();
         return;
       }
@@ -698,13 +758,13 @@ function App() {
 
       setCurrentAudioSource(source);
       setCurrentAudioContext(audioContext);
-      setPlayingIndex(index);
+      setPlayingSessionKey(sessionKey);
 
       source.onended = () => {
         audioContext.close();
         setCurrentAudioSource(null);
         setCurrentAudioContext(null);
-        setPlayingIndex(null);
+        setPlayingSessionKey(null);
       };
 
       source.start(0);
@@ -713,9 +773,16 @@ function App() {
       setError(
         `音声再生エラー: ${err instanceof Error ? err.message : String(err)}`
       );
-      setPlayingIndex(null);
+      setPlayingSessionKey(null);
     }
   };
+
+  const hasPendingMessages = (source: string) =>
+    transcriptions.some(
+      (session) =>
+        session.source === source &&
+        session.messages.some((message) => !message.isFinal)
+    );
 
   return (
     <div className="flex flex-col h-screen w-screen bg-base-100">
@@ -811,78 +878,99 @@ function App() {
             </div>
           ) : (
             <div className="flex flex-col pb-4">
-              {transcriptions.map((segment, index) => (
-                <div
-                  key={index}
-                  className={`chat ${
-                    segment.source === "user" ? "chat-end" : "chat-start"
-                  }`}
-                >
-                  <div className="chat-header opacity-50 text-xs flex items-center gap-1 mb-1">
-                    {segment.source === "user" ? "You" : "System"}
-                    <time>
-                      {new Date(segment.timestamp).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
-                    </time>
-                  </div>
+              {transcriptions.map((session) => {
+                const alignment =
+                  session.source === "user" ? "chat-end" : "chat-start";
+                const bubbleColor =
+                  session.source === "user"
+                    ? "chat-bubble-primary"
+                    : "chat-bubble-secondary";
+                const sessionText = session.messages
+                  .map((message) => message.text)
+                  .join("\n");
+                const sessionAudio = session.messages
+                  .map(
+                    (message) => session.audioChunks[message.messageId] || []
+                  )
+                  .flat();
+                return (
                   <div
-                    className={`chat-bubble text-sm ${
-                      segment.source === "user"
-                        ? "chat-bubble-primary"
-                        : "chat-bubble-secondary"
-                    } ${!segment.isFinal ? "opacity-70" : ""}`}
+                    key={session.sessionKey}
+                    className={`chat ${alignment} mb-4 space-y-2`}
                   >
-                    {segment.text}
-                    {!segment.isFinal && (
-                      <span className="loading loading-dots loading-xs ml-1 align-bottom"></span>
-                    )}
-                  </div>
-                  <div className="chat-footer opacity-50 flex gap-1 items-center mt-1">
-                    <button
-                      onClick={() =>
-                        navigator.clipboard.writeText(segment.text)
-                      }
-                      className="btn btn-ghost btn-xs btn-circle"
-                      title="コピー"
-                    >
-                      <Copy className="w-3 h-3" />
-                    </button>
-                    {segment.audioData && (
+                    <div className={`chat-bubble text-sm ${bubbleColor}`}>
+                      <div className="space-y-2">
+                        {session.messages.map((message) => {
+                          const messageKey = `${session.sessionKey}-${message.messageId}`;
+                          return (
+                            <span
+                              key={messageKey}
+                              className={` ${
+                                message.isFinal ? "" : "opacity-70"
+                              }`}
+                            >
+                              <span className="flex-1 text-left">
+                                {message.text}
+                                {!message.isFinal && (
+                                  <span className="loading loading-dots loading-xs ml-1 align-bottom"></span>
+                                )}
+                              </span>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <div className="chat-footer opacity-50 flex justify-between items-center mt-1">
                       <button
-                        onClick={() => playAudio(segment.audioData!, index)}
+                        onClick={() =>
+                          navigator.clipboard.writeText(sessionText)
+                        }
                         className="btn btn-ghost btn-xs btn-circle"
+                        title="コピー"
                       >
-                        {playingIndex === index ? (
-                          <Square className="w-3 h-3" />
-                        ) : (
-                          <Play className="w-3 h-3" />
-                        )}
+                        <Copy className="w-3 h-3" />
                       </button>
-                    )}
+                      {sessionAudio.length > 0 && (
+                        <button
+                          onClick={() =>
+                            playSessionAudio(sessionAudio, session.sessionKey)
+                          }
+                          className="btn btn-ghost btn-xs btn-circle"
+                        >
+                          {playingSessionKey === session.sessionKey ? (
+                            <Square className="w-3 h-3" />
+                          ) : (
+                            <Play className="w-3 h-3" />
+                          )}
+                        </button>
+                      )}
+
+                      <time className="text-[10px] opacity-60">
+                        {new Date(
+                          session.messages[0].timestamp
+                        ).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </time>
+                    </div>
+                  </div>
+                );
+              })}
+              {voiceActivity.user && !hasPendingMessages("user") && (
+                <div className="chat chat-end">
+                  <div className="chat-bubble chat-bubble-primary opacity-70 text-sm">
+                    <span className="loading loading-dots loading-xs"></span>
                   </div>
                 </div>
-              ))}
-              {voiceActivity.user &&
-                transcriptions.filter((t) => t.source === "user" && !t.isFinal)
-                  .length === 0 && (
-                  <div className="chat chat-end">
-                    <div className="chat-bubble chat-bubble-primary opacity-70 text-sm">
-                      <span className="loading loading-dots loading-xs"></span>
-                    </div>
+              )}
+              {voiceActivity.system && !hasPendingMessages("system") && (
+                <div className="chat chat-start">
+                  <div className="chat-bubble chat-bubble-secondary opacity-70 text-sm">
+                    <span className="loading loading-dots loading-xs"></span>
                   </div>
-                )}
-              {voiceActivity.system &&
-                transcriptions.filter(
-                  (t) => t.source === "system" && !t.isFinal
-                ).length === 0 && (
-                  <div className="chat chat-start">
-                    <div className="chat-bubble chat-bubble-secondary opacity-70 text-sm">
-                      <span className="loading loading-dots loading-xs"></span>
-                    </div>
-                  </div>
-                )}
+                </div>
+              )}
               <div ref={messagesEndRef} />
             </div>
           )}
