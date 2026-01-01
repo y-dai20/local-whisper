@@ -63,8 +63,18 @@ interface StreamingConfig {
 interface VoiceActivityEvent {
   source: string;
   isActive: boolean;
+  sessionId: number;
   timestamp: number;
 }
+
+type VoiceActivitySourceState = {
+  isActive: boolean;
+  sessionId: number | null;
+};
+
+type VoiceActivityState = Record<"user" | "system", VoiceActivitySourceState>;
+
+type VoiceSource = "user" | "system";
 
 interface WhisperParamsConfig {
   audioCtx: number;
@@ -120,10 +130,10 @@ function App() {
   const [isRecordingActive, setIsRecordingActive] = useState(false);
   const [isRecordingBusy, setIsRecordingBusy] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
-  const [voiceActivity, setVoiceActivity] = useState<{
-    user: boolean;
-    system: boolean;
-  }>({ user: false, system: false });
+  const [voiceActivity, setVoiceActivity] = useState<VoiceActivityState>({
+    user: { isActive: false, sessionId: null },
+    system: { isActive: false, sessionId: null },
+  });
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
@@ -480,11 +490,17 @@ function App() {
     const unlistenVoiceActivity = listen<VoiceActivityEvent>(
       "voice-activity",
       (event) => {
-        const { source, isActive } = event.payload;
-        setVoiceActivity((prev) => ({
-          ...prev,
-          [source]: isActive,
-        }));
+        const { source, isActive, sessionId } = event.payload;
+        console.log("Voice activity event:", event.payload);
+        setVoiceActivity((prev) => {
+          return {
+            ...prev,
+            [source]: {
+              isActive,
+              sessionId,
+            },
+          };
+        });
       }
     );
 
@@ -777,12 +793,28 @@ function App() {
     }
   };
 
-  const hasPendingMessages = (source: string) =>
-    transcriptions.some(
-      (session) =>
-        session.source === source &&
-        session.messages.some((message) => !message.isFinal)
-    );
+  const isPendingVoiceSession = (source: VoiceSource) => {
+    const state = voiceActivity[source];
+    if (!state.isActive || !state.sessionId) {
+      return false;
+    }
+    if (
+      !transcriptions.some(
+        (session) =>
+          session.source === source && session.sessionId === state.sessionId
+      )
+    ) {
+      return false;
+    }
+    return true;
+  };
+
+  const pendingUserSessionKey = isPendingVoiceSession("user");
+  const pendingSystemSessionKey = isPendingVoiceSession("system");
+  const showUserActivityIndicator =
+    voiceActivity.user.isActive && !pendingUserSessionKey;
+  const showSystemActivityIndicator =
+    voiceActivity.system.isActive && !pendingSystemSessionKey;
 
   return (
     <div className="flex flex-col h-screen w-screen bg-base-100">
@@ -865,8 +897,8 @@ function App() {
           )}
 
           {transcriptions.length === 0 &&
-          !voiceActivity.user &&
-          !voiceActivity.system ? (
+          !voiceActivity.user.isActive &&
+          !voiceActivity.system.isActive ? (
             <div className="flex-1 flex flex-col items-center justify-center text-center text-base-content/30 min-h-[50vh]">
               <MessageSquare className="w-16 h-16 mb-4 opacity-20" />
               <p className="text-sm font-medium">
@@ -957,14 +989,14 @@ function App() {
                   </div>
                 );
               })}
-              {voiceActivity.user && !hasPendingMessages("user") && (
+              {showUserActivityIndicator && (
                 <div className="chat chat-end">
                   <div className="chat-bubble chat-bubble-primary opacity-70 text-sm">
                     <span className="loading loading-dots loading-xs"></span>
                   </div>
                 </div>
               )}
-              {voiceActivity.system && !hasPendingMessages("system") && (
+              {showSystemActivityIndicator && (
                 <div className="chat chat-start">
                   <div className="chat-bubble chat-bubble-secondary opacity-70 text-sm">
                     <span className="loading loading-dots loading-xs"></span>

@@ -363,7 +363,7 @@ fn transcribe_and_emit(
     let (new_transcribed_samples, next_message_id) = transcribe_and_emit_common(
         audio_data,
         &lang,
-        session_id_counter,
+        source_state.session_id_counter,
         is_final,
         app_handle,
         source.event_source(),

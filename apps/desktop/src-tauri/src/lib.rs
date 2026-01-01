@@ -147,6 +147,8 @@ struct VoiceActivityEvent {
     source: String,
     #[serde(rename = "isActive")]
     is_active: bool,
+    #[serde(rename = "sessionId")]
+    session_id: u64,
     timestamp: u64,
 }
 
@@ -270,10 +272,16 @@ pub(crate) async fn get_mic_status_impl() -> Result<bool, String> {
     Ok(!state_guard.is_muted)
 }
 
-pub(crate) fn emit_voice_activity_event(app_handle: &AppHandle, source: &str, is_active: bool) {
+pub(crate) fn emit_voice_activity_event(
+    app_handle: &AppHandle,
+    source: &str,
+    is_active: bool,
+    session_id: u64,
+) {
     let event = VoiceActivityEvent {
         source: source.to_string(),
         is_active,
+        session_id,
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

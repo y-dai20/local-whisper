@@ -61,6 +61,9 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
         let app_handle_ptr = addr_of!(APP_HANDLE);
         let app_handle = (*app_handle_ptr).as_ref();
         let language = state.language.clone();
+        let session_id_counter = state
+            .transcription_state(TranscriptionSource::System)
+            .session_id_counter;
         drop(state);
 
         let slice = std::slice::from_raw_parts(samples, count as usize);
@@ -71,7 +74,13 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
             sum_squares += sample * sample;
             max_sample = max_sample.max(sample.abs());
 
-            process_system_audio_sample(session, sample, app_handle, language.as_deref());
+            process_system_audio_sample(
+                session,
+                sample,
+                app_handle,
+                language.as_deref(),
+                session_id_counter,
+            );
         }
 
         let rms = if count > 0 {
@@ -104,6 +113,7 @@ fn process_system_audio_sample(
     sample: f32,
     app_handle: Option<&AppHandle>,
     language: Option<&str>,
+    session_id_counter: u64,
 ) {
     session.session_samples += 1;
     session.vad_pending.push(sample);
@@ -130,7 +140,12 @@ fn process_system_audio_sample(
     if let Some(app) = app_handle {
         let now = std::time::Instant::now();
         if now.duration_since(session.last_vad_event_time).as_millis() >= 500 {
-            super::emit_voice_activity_event(app, "system", session.is_voice_active);
+            super::emit_voice_activity_event(
+                app,
+                "system",
+                session.is_voice_active,
+                session_id_counter,
+            );
             session.last_vad_event_time = now;
         }
     }
@@ -193,7 +208,7 @@ fn queue_system_audio_transcription(
 
         if let Some(app) = app_handle {
             drop(state_guard);
-            super::emit_voice_activity_event(app, "system", session.is_voice_active);
+            super::emit_voice_activity_event(app, "system", session.is_voice_active, session_id_counter);
         }
     }
 }

@@ -181,7 +181,10 @@ pub fn push_sample_with_optional_vad(
             .vad_state
             .as_ref()
             .map_or(false, |v| v.is_voice_active);
-        emit_voice_activity_event(app_handle, "user", is_voice_active);
+        let session_id = state
+            .transcription_state(TranscriptionSource::Mic)
+            .session_id_counter;
+        emit_voice_activity_event(app_handle, "user", is_voice_active, session_id);
         state.last_vad_event_time = now;
     }
 

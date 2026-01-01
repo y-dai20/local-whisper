@@ -1,7 +1,7 @@
 pub const VAD_SAMPLE_RATE: u32 = 16_000;
-pub const VAD_CHUNK_SIZE: usize = 512;
+pub const VAD_CHUNK_SIZE: usize = 500;
 pub const DEFAULT_VAD_THRESHOLD: f32 = 0.1;
-pub const DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES: usize = 4 * VAD_SAMPLE_RATE as usize;
+pub const DEFAULT_PARTIAL_TRANSCRIPT_INTERVAL_SAMPLES: usize = 2 * VAD_SAMPLE_RATE as usize;
 pub const SILENCE_TIMEOUT_SAMPLES: usize = 1 * VAD_SAMPLE_RATE as usize;
 pub const VAD_PRE_BUFFER_MS: usize = 200;
 pub const VAD_POST_BUFFER_MS: usize = 200;
