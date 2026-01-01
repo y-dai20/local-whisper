@@ -11,13 +11,6 @@ pub enum TranscriptionSource {
 }
 
 impl TranscriptionSource {
-    pub fn session_prefix(self) -> &'static str {
-        match self {
-            TranscriptionSource::Mic => "mic",
-            TranscriptionSource::System => "system",
-        }
-    }
-
     pub fn event_source(self) -> &'static str {
         match self {
             TranscriptionSource::Mic => "user",

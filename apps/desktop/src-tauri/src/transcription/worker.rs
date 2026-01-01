@@ -219,7 +219,6 @@ pub fn spawn_transcription_worker(
 pub fn transcribe_and_emit_common(
     audio_data: &[f32],
     language: &str,
-    session_id_prefix: &str,
     session_id_counter: u64,
     is_final: bool,
     app_handle: &AppHandle,
@@ -364,7 +363,6 @@ fn transcribe_and_emit(
     let (new_transcribed_samples, next_message_id) = transcribe_and_emit_common(
         audio_data,
         &lang,
-        source.session_prefix(),
         session_id_counter,
         is_final,
         app_handle,
