@@ -106,11 +106,11 @@ function App() {
 
   const [streamingConfig, setStreamingConfig] = useState<StreamingConfig>({
     vadThreshold: 0.1,
-    partialIntervalSeconds: 4,
+    partialIntervalSeconds: 2,
   });
   const [isSavingStreamingConfig, setIsSavingStreamingConfig] = useState(false);
   const [whisperParams, setWhisperParams] = useState<WhisperParamsConfig>({
-    audioCtx: 512,
+    audioCtx: 1000,
     temperature: 0,
   });
   const [isSavingWhisperParams, setIsSavingWhisperParams] = useState(false);
@@ -1216,9 +1216,9 @@ function App() {
                   </p>
                   <input
                     type="range"
-                    min="64"
+                    min="50"
                     max="1500"
-                    step="32"
+                    step="50"
                     value={whisperParams.audioCtx}
                     onChange={(e) =>
                       setWhisperParams((prev) => ({
@@ -1230,9 +1230,9 @@ function App() {
                   />
                   <input
                     type="number"
-                    min="64"
+                    min="50"
                     max="1500"
-                    step="32"
+                    step="50"
                     value={whisperParams.audioCtx}
                     onChange={(e) =>
                       setWhisperParams((prev) => ({
