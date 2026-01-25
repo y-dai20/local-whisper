@@ -91,11 +91,11 @@ function App() {
     [string, string][]
   >([]);
   const [transcriptions, setTranscriptions] = useState<SessionTranscription[]>(
-    []
+    [],
   );
   const [error, setError] = useState("");
   const [playingSessionKey, setPlayingSessionKey] = useState<string | null>(
-    null
+    null,
   );
   const [currentAudioSource, setCurrentAudioSource] =
     useState<AudioBufferSourceNode | null>(null);
@@ -104,7 +104,7 @@ function App() {
   const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
   const [selectedAudioDevice, setSelectedAudioDevice] = useState<string>("");
   const [hasMicPermission, setHasMicPermission] = useState<boolean | null>(
-    null
+    null,
   );
   const [showSettings, setShowSettings] = useState(false);
   const [remoteModels, setRemoteModels] = useState<RemoteModelStatus[]>([]);
@@ -147,7 +147,7 @@ function App() {
       localStorage.setItem("vadThreshold", config.vadThreshold.toString());
       localStorage.setItem(
         "partialIntervalSeconds",
-        config.partialIntervalSeconds.toString()
+        config.partialIntervalSeconds.toString(),
       );
     } catch (err) {
       console.error("Failed to load streaming config:", err);
@@ -166,7 +166,7 @@ function App() {
         if (config.partialIntervalSeconds) {
           localStorage.setItem(
             "partialIntervalSeconds",
-            config.partialIntervalSeconds.toString()
+            config.partialIntervalSeconds.toString(),
           );
         }
       } catch (err) {
@@ -174,13 +174,13 @@ function App() {
         setError(
           `ストリーミング設定エラー: ${
             err instanceof Error ? err.message : String(err)
-          }`
+          }`,
         );
       } finally {
         setIsSavingStreamingConfig(false);
       }
     },
-    [setError]
+    [setError],
   );
 
   const loadWhisperParams = useCallback(async () => {
@@ -205,20 +205,20 @@ function App() {
         localStorage.setItem("whisperAudioCtx", params.audioCtx.toString());
         localStorage.setItem(
           "whisperTemperature",
-          params.temperature.toString()
+          params.temperature.toString(),
         );
       } catch (err) {
         console.error("Failed to save Whisper params:", err);
         setError(
           `Whisper設定エラー: ${
             err instanceof Error ? err.message : String(err)
-          }`
+          }`,
         );
       } finally {
         setIsSavingWhisperParams(false);
       }
     },
-    [setError]
+    [setError],
   );
 
   const toggleRecording = async () => {
@@ -248,20 +248,48 @@ function App() {
       }
 
       setIsRecordingBusy(true);
+      let startedScreenRecording = false;
+      let startedRecording = false;
+      let startedSystemAudio = false;
       try {
         if (screenRecordingEnabled) {
           await invoke("start_screen_recording");
+          startedScreenRecording = true;
         }
         await invoke("start_recording", {
           language: selectedLanguage === "auto" ? null : selectedLanguage,
         });
+        startedRecording = true;
         await invoke("start_system_audio");
+        startedSystemAudio = true;
         setIsRecordingActive(true);
         setError("");
       } catch (err) {
         console.error("Failed to start recording session:", err);
+        if (startedSystemAudio) {
+          try {
+            await invoke("stop_system_audio");
+          } catch (stopErr) {
+            console.error("Failed to rollback system audio:", stopErr);
+          }
+        }
+        if (startedRecording) {
+          try {
+            await invoke("stop_recording");
+          } catch (stopErr) {
+            console.error("Failed to rollback recording session:", stopErr);
+          }
+        }
+        if (startedScreenRecording) {
+          try {
+            await invoke("stop_screen_recording");
+          } catch (stopErr) {
+            console.error("Failed to rollback screen recording:", stopErr);
+          }
+        }
+        setIsRecordingActive(false);
         setError(
-          `録画開始エラー: ${err instanceof Error ? err.message : String(err)}`
+          `録画開始エラー: ${err instanceof Error ? err.message : String(err)}`,
         );
       } finally {
         setIsRecordingBusy(false);
@@ -281,7 +309,7 @@ function App() {
     } catch (err) {
       console.error("Failed to stop recording session:", err);
       setError(
-        `録画停止エラー: ${err instanceof Error ? err.message : String(err)}`
+        `録画停止エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
       setIsRecordingBusy(false);
@@ -291,7 +319,7 @@ function App() {
   const loadRecordingSaveConfig = async () => {
     try {
       const [enabled, path] = await invoke<[boolean, string | null]>(
-        "get_recording_save_config"
+        "get_recording_save_config",
       );
       setRecordingSaveEnabled(enabled);
       setRecordingSavePath(path || "");
@@ -315,7 +343,7 @@ function App() {
       setError(
         `録画保存設定エラー: ${
           err instanceof Error ? err.message : String(err)
-        }`
+        }`,
       );
     }
   };
@@ -334,7 +362,7 @@ function App() {
 
       const savedVadThreshold = localStorage.getItem("vadThreshold");
       const savedPartialInterval = localStorage.getItem(
-        "partialIntervalSeconds"
+        "partialIntervalSeconds",
       );
       if (savedVadThreshold || savedPartialInterval) {
         setStreamingConfig((prev) => ({
@@ -360,14 +388,14 @@ function App() {
               : prev.temperature,
           };
           invoke("set_whisper_params", { config: updated }).catch((err) =>
-            console.error("Failed to reapply Whisper params:", err)
+            console.error("Failed to reapply Whisper params:", err),
           );
           return updated;
         });
       }
 
       const savedRecordingSaveEnabled = localStorage.getItem(
-        "recordingSaveEnabled"
+        "recordingSaveEnabled",
       );
       const savedRecordingSavePath = localStorage.getItem("recordingSavePath");
       if (savedRecordingSaveEnabled !== null) {
@@ -379,7 +407,7 @@ function App() {
       }
 
       const savedScreenRecordingEnabled = localStorage.getItem(
-        "screenRecordingEnabled"
+        "screenRecordingEnabled",
       );
       if (savedScreenRecordingEnabled !== null) {
         const enabled = savedScreenRecordingEnabled === "true";
@@ -412,7 +440,7 @@ function App() {
       setError(
         `画面録画設定エラー: ${
           err instanceof Error ? err.message : String(err)
-        }`
+        }`,
       );
     }
   };
@@ -429,18 +457,18 @@ function App() {
           const sessionKey = `${segment.source}-${segment.sessionId}`;
           const sessions = [...prev];
           const sessionIndex = sessions.findIndex(
-            (s) => s.sessionKey === sessionKey
+            (s) => s.sessionKey === sessionKey,
           );
 
           const upsertMessages = (
-            existing: TranscriptionSegment[] | undefined
+            existing: TranscriptionSegment[] | undefined,
           ) => {
             if (!existing) {
               return [segment];
             }
             const messages = [...existing];
             const messageIndex = messages.findIndex(
-              (m) => m.messageId === segment.messageId
+              (m) => m.messageId === segment.messageId,
             );
             if (messageIndex >= 0) {
               messages[messageIndex] = segment;
@@ -452,7 +480,7 @@ function App() {
           };
 
           const upsertAudioChunks = (
-            existing: Record<number, number[]> | undefined
+            existing: Record<number, number[]> | undefined,
           ) => {
             const chunks = { ...(existing || {}) };
             if (segment.audioData?.length) {
@@ -484,7 +512,7 @@ function App() {
             },
           ];
         });
-      }
+      },
     );
 
     const unlistenVoiceActivity = listen<VoiceActivityEvent>(
@@ -501,7 +529,7 @@ function App() {
             },
           };
         });
-      }
+      },
     );
 
     loadSettingsFromLocalStorage();
@@ -599,7 +627,7 @@ function App() {
   const checkMicPermission = async () => {
     try {
       const hasPermission = await invoke<boolean>(
-        "check_microphone_permission"
+        "check_microphone_permission",
       );
       setHasMicPermission(hasPermission);
     } catch (err) {
@@ -634,7 +662,7 @@ function App() {
     } catch (err) {
       console.error("Failed to update language:", err);
       setError(
-        `言語変更エラー: ${err instanceof Error ? err.message : String(err)}`
+        `言語変更エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   };
@@ -649,7 +677,7 @@ function App() {
       setError(
         `モデルインストールエラー: ${
           err instanceof Error ? err.message : String(err)
-        }`
+        }`,
       );
     } finally {
       setModelOperations((prev) => ({ ...prev, [modelId]: false }));
@@ -666,7 +694,7 @@ function App() {
     } catch (err) {
       console.error("Delete model error:", err);
       setError(
-        `モデル削除エラー: ${err instanceof Error ? err.message : String(err)}`
+        `モデル削除エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
       setModelOperations((prev) => ({ ...prev, [model.id]: false }));
@@ -715,7 +743,7 @@ function App() {
     } catch (err) {
       console.error("Mic start error:", err);
       setError(
-        `マイク開始エラー: ${err instanceof Error ? err.message : String(err)}`
+        `マイク開始エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   };
@@ -728,7 +756,7 @@ function App() {
     } catch (err) {
       console.error("Mic stop error:", err);
       setError(
-        `録音停止エラー: ${err instanceof Error ? err.message : String(err)}`
+        `録音停止エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   };
@@ -787,7 +815,7 @@ function App() {
     } catch (err) {
       console.error("Audio playback error:", err);
       setError(
-        `音声再生エラー: ${err instanceof Error ? err.message : String(err)}`
+        `音声再生エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
       setPlayingSessionKey(null);
     }
@@ -801,7 +829,7 @@ function App() {
     if (
       !transcriptions.some(
         (session) =>
-          session.source === source && session.sessionId === state.sessionId
+          session.source === source && session.sessionId === state.sessionId,
       )
     ) {
       return false;
@@ -848,8 +876,8 @@ function App() {
                 !isInitialized
                   ? "btn-disabled"
                   : isMuted
-                  ? "btn-ghost"
-                  : "btn-primary"
+                    ? "btn-ghost"
+                    : "btn-primary"
               }`}
               onClick={toggleMute}
               disabled={!isInitialized}
@@ -922,7 +950,7 @@ function App() {
                   .join("\n");
                 const sessionAudio = session.messages
                   .map(
-                    (message) => session.audioChunks[message.messageId] || []
+                    (message) => session.audioChunks[message.messageId] || [],
                   )
                   .flat();
                 return (
@@ -979,7 +1007,7 @@ function App() {
 
                       <time className="text-[10px] opacity-60">
                         {new Date(
-                          session.messages[0].timestamp
+                          session.messages[0].timestamp,
                         ).toLocaleTimeString([], {
                           hour: "2-digit",
                           minute: "2-digit",
@@ -1167,7 +1195,7 @@ function App() {
                       onChange={(e) =>
                         saveRecordingSaveConfig(
                           e.target.checked,
-                          recordingSavePath
+                          recordingSavePath,
                         )
                       }
                     />
@@ -1186,7 +1214,7 @@ function App() {
                       onBlur={() =>
                         saveRecordingSaveConfig(
                           recordingSaveEnabled,
-                          recordingSavePath
+                          recordingSavePath,
                         )
                       }
                       className="input input-bordered w-full"

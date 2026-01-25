@@ -10,43 +10,41 @@ class SystemAudioCapture: NSObject, SCStreamDelegate, SCStreamOutput {
     private var isCapturing = false
     private var hasLoggedFormatInfo = false
 
-    func startCapture(callback: @escaping @convention(c) (UnsafePointer<Float>, Int) -> Void) {
+    func startCapture(callback: @escaping @convention(c) (UnsafePointer<Float>, Int) -> Void) async throws {
         self.audioCallback = callback
 
-        Task {
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
 
-                guard let display = content.displays.first else {
-                    print("No displays found")
-                    return
-                }
-
-                print("Display found: \(display)")
-
-                // システム音声をキャプチャするには、displayとexcludingWindowsを使用
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-
-                let config = SCStreamConfiguration()
-                config.capturesAudio = true
-                config.sampleRate = 16000
-                config.channelCount = 1
-                config.excludesCurrentProcessAudio = false
-                config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-
-                let stream = SCStream(filter: filter, configuration: config, delegate: self)
-
-                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.local-whisper.audio"))
-
-                try await stream.startCapture()
-
-                self.stream = stream
-                self.isCapturing = true
-                print("System audio stream started successfully")
-            } catch {
-                print("Failed to start capture: \(error)")
-            }
+        guard let display = content.displays.first else {
+            throw NSError(
+                domain: "com.local-whisper.system-audio",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "No displays found for capture"]
+            )
         }
+
+        print("Display found: \(display)")
+
+        // システム音声をキャプチャするには、displayとexcludingWindowsを使用
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.sampleRate = 16000
+        config.channelCount = 1
+        config.excludesCurrentProcessAudio = false
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.local-whisper.audio"))
+
+        try await stream.startCapture()
+
+        self.stream = stream
+        self.isCapturing = true
+        self.hasLoggedFormatInfo = false
+        print("System audio stream started successfully")
     }
 
     func stopCapture() async {
@@ -130,16 +128,33 @@ class SystemAudioCapture: NSObject, SCStreamDelegate, SCStreamOutput {
 }
 
 private var captureInstance: SystemAudioCapture?
+private var lastSystemAudioError: NSString = ""
 
 @_cdecl("system_audio_start")
 public func systemAudioStart(callback: @escaping @convention(c) (UnsafePointer<Float>, Int) -> Void) -> Int32 {
     if #available(macOS 13.0, *) {
-        let capture = SystemAudioCapture()
-        capture.startCapture(callback: callback)
-        captureInstance = capture
-        return 0
+        let semaphore = DispatchSemaphore(value: 0)
+        var startResult: Int32 = -1
+
+        Task.detached {
+            do {
+                let capture = SystemAudioCapture()
+                try await capture.startCapture(callback: callback)
+                captureInstance = capture
+                lastSystemAudioError = ""
+                startResult = 0
+            } catch {
+                let nsError = error as NSError
+                lastSystemAudioError = error.localizedDescription as NSString
+                startResult = Int32(nsError.code)
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+        return startResult
     } else {
-        print("System audio capture requires macOS 13.0+")
+        lastSystemAudioError = "System audio capture requires macOS 13.0+" as NSString
         return -2
     }
 }
@@ -160,4 +175,9 @@ public func systemAudioStop() -> Int32 {
     } else {
         return -2
     }
+}
+
+@_cdecl("system_audio_last_error")
+public func systemAudioLastError() -> UnsafePointer<CChar>? {
+    return lastSystemAudioError.utf8String
 }

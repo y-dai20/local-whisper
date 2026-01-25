@@ -3,10 +3,11 @@ use crate::audio::{
 };
 use crate::transcription::worker::queue_transcription_with_source;
 use crate::transcription::{spawn_transcription_worker, TranscriptionSource};
-use std::ptr::{addr_of, addr_of_mut};
 use log::{error, info};
 use parking_lot::Mutex as ParkingMutex;
-use std::os::raw::c_int;
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int};
+use std::ptr::{addr_of, addr_of_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +16,7 @@ use voice_activity_detector::VoiceActivityDetector;
 extern "C" {
     fn system_audio_start(callback: extern "C" fn(*const f32, c_int)) -> c_int;
     fn system_audio_stop() -> c_int;
+    fn system_audio_last_error() -> *const c_char;
 }
 
 struct SystemAudioSession {
@@ -36,6 +38,24 @@ static mut RECORDING_STATE: Option<Arc<ParkingMutex<RecordingState>>> = None;
 static SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_LOG_INSTANT: Mutex<Option<Instant>> = Mutex::new(None);
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+fn last_system_audio_error_message() -> Option<String> {
+    unsafe {
+        let ptr = system_audio_last_error();
+        if ptr.is_null() {
+            None
+        } else {
+            CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string())
+        }
+    }
+}
+
+fn format_system_audio_error(default_message: &str) -> String {
+    last_system_audio_error_message()
+        .filter(|s| !s.is_empty())
+        .map(|detail| format!("{default_message}: {detail}"))
+        .unwrap_or_else(|| default_message.to_string())
+}
 fn current_session_max_samples() -> usize {
     try_recording_state()
         .map(|state| state.lock().session_max_samples)
@@ -314,7 +334,7 @@ pub fn start_system_audio_capture(
         } else if result == -2 {
             Err("System audio capture requires macOS 12.3+".to_string())
         } else {
-            Err("Failed to start system audio capture".to_string())
+            Err(format_system_audio_error("Failed to start system audio capture"))
         }
     }
 }
@@ -335,7 +355,7 @@ pub fn stop_system_audio_capture(state: Arc<ParkingMutex<RecordingState>>) -> Re
         if result == 0 {
             Ok(())
         } else {
-            Err("Failed to stop system audio capture".to_string())
+            Err(format_system_audio_error("Failed to stop system audio capture"))
         }
     }
 }
