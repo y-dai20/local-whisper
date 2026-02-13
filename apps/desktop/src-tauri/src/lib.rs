@@ -527,6 +527,35 @@ pub(crate) async fn get_supported_languages_impl() -> Result<Vec<(String, String
     ])
 }
 
+pub(crate) async fn set_transcription_suppressed_impl(enabled: bool) -> Result<(), String> {
+    let state = recording_state();
+    let mut state_guard = state.lock();
+    state_guard.suppress_transcription = enabled;
+
+    if enabled {
+        state_guard.audio_buffer.clear();
+        state_guard.session_audio.clear();
+        state_guard.session_samples = 0;
+        state_guard.last_voice_sample = None;
+        state_guard.last_partial_emit_samples = 0;
+        if let Some(vad_state) = state_guard.vad_state.as_mut() {
+            vad_state.pending.clear();
+            vad_state.pre_buffer.clear();
+            vad_state.post_buffer_remaining = 0;
+            vad_state.is_voice_active = false;
+        }
+    }
+    drop(state_guard);
+
+    system_audio::set_transcription_suppressed(enabled);
+    info!(
+        "Transcription suppression {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+
+    Ok(())
+}
+
 fn cleanup_on_exit() {
     if SHUTDOWN_CLEANED.swap(true, Ordering::SeqCst) {
         return;

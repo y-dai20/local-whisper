@@ -42,6 +42,17 @@ static SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_LOG_INSTANT: Mutex<Option<Instant>> = Mutex::new(None);
 const LOG_INTERVAL: Duration = Duration::from_secs(2);
 
+fn reset_system_audio_session_tracking(session: &mut SystemAudioSession) {
+    session.session_audio.clear();
+    session.vad_pending.clear();
+    session.pre_buffer.clear();
+    session.post_buffer_remaining = 0;
+    session.session_samples = 0;
+    session.last_voice_sample = None;
+    session.last_partial_emit_samples = 0;
+    session.is_voice_active = false;
+}
+
 fn last_system_audio_error_message() -> Option<String> {
     unsafe {
         let ptr = system_audio_last_error();
@@ -87,7 +98,12 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
         let session_id_counter = state
             .transcription_state(TranscriptionSource::System)
             .session_id_counter;
+        let suppress_transcription = state.suppress_transcription;
         drop(state);
+
+        if suppress_transcription {
+            return;
+        }
 
         let slice = std::slice::from_raw_parts(samples, count as usize);
 
@@ -225,6 +241,9 @@ fn queue_system_audio_transcription(
             return;
         };
         let state_guard = state_arc.lock();
+        if state_guard.suppress_transcription {
+            return;
+        }
         let Some(tx) = state_guard.transcription_tx.as_ref() else {
             error!("Transcription worker not running; cannot queue system transcription");
             return;
@@ -400,4 +419,16 @@ pub fn update_language(language: Option<String>) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+pub fn set_transcription_suppressed(suppressed: bool) {
+    if !suppressed {
+        return;
+    }
+    unsafe {
+        let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
+        if let Some(session) = (*session_ptr).as_mut() {
+            reset_system_audio_session_tracking(session);
+        }
+    }
 }

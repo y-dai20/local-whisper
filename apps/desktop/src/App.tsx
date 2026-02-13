@@ -135,6 +135,7 @@ function App() {
     user: { isActive: false, sessionId: null },
     system: { isActive: false, sessionId: null },
   });
+  const transcriptionSuppressedForPlaybackRef = useRef(false);
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
@@ -773,6 +774,21 @@ function App() {
       setCurrentAudioContext(null);
     }
     setPlayingSessionKey(null);
+
+    if (transcriptionSuppressedForPlaybackRef.current) {
+      invoke("set_transcription_suppressed", { enabled: false })
+        .then(() => {
+          transcriptionSuppressedForPlaybackRef.current = false;
+        })
+        .catch((err) => {
+          console.error("Failed to disable transcription suppression:", err);
+          setError(
+            `文字起こし再開エラー: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+    }
   };
 
   const clearAllMessages = () => {
@@ -780,7 +796,7 @@ function App() {
     setTranscriptions([]);
   };
 
-  const playSessionAudio = (audioData: number[], sessionKey: string) => {
+  const playSessionAudio = async (audioData: number[], sessionKey: string) => {
     if (audioData.length === 0) {
       return;
     }
@@ -792,6 +808,20 @@ function App() {
 
       if (currentAudioSource || currentAudioContext) {
         stopAudio();
+      }
+
+      if (!transcriptionSuppressedForPlaybackRef.current) {
+        try {
+          await invoke("set_transcription_suppressed", { enabled: true });
+          transcriptionSuppressedForPlaybackRef.current = true;
+        } catch (err) {
+          console.error("Failed to enable transcription suppression:", err);
+          setError(
+            `文字起こし停止エラー: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
       }
 
       const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -815,6 +845,20 @@ function App() {
         setCurrentAudioSource(null);
         setCurrentAudioContext(null);
         setPlayingSessionKey(null);
+        if (transcriptionSuppressedForPlaybackRef.current) {
+          invoke("set_transcription_suppressed", { enabled: false })
+            .then(() => {
+              transcriptionSuppressedForPlaybackRef.current = false;
+            })
+            .catch((err) => {
+              console.error("Failed to disable transcription suppression:", err);
+              setError(
+                `文字起こし再開エラー: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            });
+        }
       };
 
       source.start(0);
@@ -824,6 +868,18 @@ function App() {
         `音声再生エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
       setPlayingSessionKey(null);
+      if (transcriptionSuppressedForPlaybackRef.current) {
+        invoke("set_transcription_suppressed", { enabled: false })
+          .then(() => {
+            transcriptionSuppressedForPlaybackRef.current = false;
+          })
+          .catch((resumeErr) => {
+            console.error(
+              "Failed to disable transcription suppression:",
+              resumeErr,
+            );
+          });
+      }
     }
   };
 

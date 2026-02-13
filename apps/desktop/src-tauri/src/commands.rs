@@ -146,6 +146,11 @@ async fn get_supported_languages() -> Result<Vec<(String, String)>, String> {
     crate::get_supported_languages_impl().await
 }
 
+#[tauri::command]
+async fn set_transcription_suppressed(enabled: bool) -> Result<(), String> {
+    crate::set_transcription_suppressed_impl(enabled).await
+}
+
 pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         scan_models,
@@ -177,5 +182,6 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         stop_screen_recording,
         get_screen_recording_status,
         get_supported_languages,
+        set_transcription_suppressed,
     ])
 }

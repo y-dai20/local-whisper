@@ -53,6 +53,7 @@ pub struct RecordingState {
     pub recording_save_enabled: bool,
     pub screen_recording_enabled: bool,
     pub screen_recording_active: bool,
+    pub suppress_transcription: bool,
     pub current_recording_dir: Option<String>,
     pub last_vad_event_time: Instant,
     pub session_max_samples: usize,
@@ -83,6 +84,7 @@ pub fn default_recording_state() -> RecordingState {
         recording_save_enabled: false,
         screen_recording_enabled: false,
         screen_recording_active: false,
+        suppress_transcription: false,
         current_recording_dir: None,
         last_vad_event_time: Instant::now(),
         session_max_samples: calculate_session_max_samples(default_params.audio_ctx),
@@ -124,4 +126,3 @@ pub fn recording_state() -> Arc<ParkingMutex<RecordingState>> {
 pub fn try_recording_state() -> Option<Arc<ParkingMutex<RecordingState>>> {
     RECORDING_STATE.get().cloned()
 }
-

@@ -78,7 +78,9 @@ pub fn finalize_active_session(state: &mut RecordingState, reason: &str) {
         state.current_recording_dir.as_deref(),
     );
 
-    queue_transcription(state, true);
+    if !state.suppress_transcription {
+        queue_transcription(state, true);
+    }
 
     state.session_audio.clear();
     state.session_samples = 0;
@@ -103,6 +105,10 @@ pub fn push_sample_with_optional_vad(
     sample: f32,
     app_handle: &tauri::AppHandle,
 ) {
+    if state.suppress_transcription {
+        return;
+    }
+
     state.session_samples += 1;
 
     if state.vad_state.is_none() {
@@ -197,7 +203,9 @@ pub fn push_sample_with_optional_vad(
     if state.session_samples - state.last_partial_emit_samples
         >= state.partial_transcript_interval_samples
     {
-        queue_transcription(state, false);
+        if !state.suppress_transcription {
+            queue_transcription(state, false);
+        }
         state.last_partial_emit_samples = state.session_samples;
     }
 }

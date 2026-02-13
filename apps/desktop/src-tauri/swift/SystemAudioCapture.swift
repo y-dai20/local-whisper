@@ -32,7 +32,8 @@ class SystemAudioCapture: NSObject, SCStreamDelegate, SCStreamOutput {
         config.capturesAudio = true
         config.sampleRate = 16000
         config.channelCount = 1
-        config.excludesCurrentProcessAudio = false
+        // Prevent this app's own playback (e.g. message preview) from being re-captured.
+        config.excludesCurrentProcessAudio = true
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
