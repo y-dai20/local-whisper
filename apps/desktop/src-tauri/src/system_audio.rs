@@ -1,5 +1,6 @@
 use crate::audio::{
-    try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES, VAD_CHUNK_SIZE, VAD_SAMPLE_RATE,
+    try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES, VAD_CHUNK_SIZE,
+    VAD_POST_BUFFER_SAMPLES, VAD_PRE_BUFFER_SAMPLES, VAD_SAMPLE_RATE,
 };
 use crate::transcription::worker::queue_transcription_with_source;
 use crate::transcription::{spawn_transcription_worker, TranscriptionSource};
@@ -23,6 +24,8 @@ struct SystemAudioSession {
     session_audio: Vec<f32>,
     vad: VoiceActivityDetector,
     vad_pending: Vec<f32>,
+    pre_buffer: Vec<f32>,
+    post_buffer_remaining: usize,
     vad_threshold: f32,
     session_samples: usize,
     last_voice_sample: Option<usize>,
@@ -148,11 +151,30 @@ fn process_system_audio_sample(
         let probability = session.vad.predict(chunk_i16);
 
         if probability > session.vad_threshold {
+            if !session.is_voice_active && !session.pre_buffer.is_empty() {
+                session.session_audio.extend_from_slice(&session.pre_buffer);
+                session.pre_buffer.clear();
+            }
             session.session_audio.extend_from_slice(&chunk);
+            session.post_buffer_remaining = VAD_POST_BUFFER_SAMPLES;
             session.last_voice_sample = Some(session.session_samples);
             session.is_voice_active = true;
         } else {
-            session.is_voice_active = false;
+            if session.is_voice_active && session.post_buffer_remaining > 0 {
+                session.session_audio.extend_from_slice(&chunk);
+                session.post_buffer_remaining =
+                    session.post_buffer_remaining.saturating_sub(chunk.len());
+                if session.post_buffer_remaining == 0 {
+                    session.is_voice_active = false;
+                }
+            } else {
+                session.pre_buffer.extend_from_slice(&chunk);
+                if session.pre_buffer.len() > VAD_PRE_BUFFER_SAMPLES {
+                    let excess = session.pre_buffer.len() - VAD_PRE_BUFFER_SAMPLES;
+                    session.pre_buffer.drain(0..excess);
+                }
+                session.is_voice_active = false;
+            }
         }
     }
 
@@ -277,6 +299,8 @@ fn finalize_system_audio_session(
     session.session_samples = 0;
     session.last_partial_emit_samples = 0;
     session.last_voice_sample = None;
+    session.post_buffer_remaining = 0;
+    session.is_voice_active = false;
 }
 
 pub fn start_system_audio_capture(
@@ -309,6 +333,8 @@ pub fn start_system_audio_capture(
             session_audio: Vec::new(),
             vad,
             vad_pending: Vec::new(),
+            pre_buffer: Vec::new(),
+            post_buffer_remaining: 0,
             vad_threshold,
             session_samples: 0,
             last_voice_sample: None,
@@ -375,4 +401,3 @@ pub fn update_language(language: Option<String>) -> Result<(), String> {
 
     Ok(())
 }
-
