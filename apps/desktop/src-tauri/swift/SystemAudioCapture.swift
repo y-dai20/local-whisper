@@ -166,11 +166,15 @@ public func systemAudioStop() -> Int32 {
             return -1
         }
 
-        Task {
+        let semaphore = DispatchSemaphore(value: 0)
+
+        Task.detached {
             await capture.stopCapture()
+            semaphore.signal()
         }
 
         captureInstance = nil
+        semaphore.wait()
         return 0
     } else {
         return -2

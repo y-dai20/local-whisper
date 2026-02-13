@@ -6,8 +6,9 @@ use once_cell::sync::OnceCell;
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, WindowEvent};
 
 mod audio;
 mod commands;
@@ -32,6 +33,7 @@ use transcription::worker::stop_transcription_worker;
 
 static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCell::new();
 static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
+static SHUTDOWN_CLEANED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn emit_transcription_segment(
     app_handle: &AppHandle,
@@ -525,6 +527,39 @@ pub(crate) async fn get_supported_languages_impl() -> Result<Vec<(String, String
     ])
 }
 
+fn cleanup_on_exit() {
+    if SHUTDOWN_CLEANED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    if let Some(state) = try_recording_state() {
+        let mut state_guard = state.lock();
+        let system_audio_enabled = state_guard.system_audio_enabled;
+        let screen_recording_active = state_guard.screen_recording_active;
+
+        state_guard.is_muted = true;
+        state_guard.is_recording = false;
+        state_guard.vad_state = None;
+        state_guard.current_recording_dir = None;
+        stop_transcription_worker(&mut state_guard);
+        drop(state_guard);
+
+        if system_audio_enabled {
+            if let Err(err) = system_audio::stop_system_audio_capture(state.clone()) {
+                error!("Failed to stop system audio during shutdown: {}", err);
+            }
+        }
+
+        if screen_recording_active {
+            if let Err(err) = screen_recording::stop_screen_recording() {
+                error!("Failed to stop screen recording during shutdown: {}", err);
+            }
+        }
+    }
+
+    info!("Application shutdown cleanup completed");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
@@ -533,6 +568,11 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .on_window_event(|_window, event| {
+            if let WindowEvent::CloseRequested { .. } = event {
+                cleanup_on_exit();
+            }
+        })
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
             Ok(())
