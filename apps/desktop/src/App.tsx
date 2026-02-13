@@ -1130,388 +1130,424 @@ function App() {
               </label>
             </h3>
 
-            <div className="space-y-4">
-              <div className="form-control">
-                <label className="label">
-                  <span className="label-text">モデル</span>
-                </label>
-                <select
-                  value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value)}
-                  className="select select-bordered w-full"
-                >
-                  {availableModels.map((model) => (
-                    <option key={model.path} value={model.path}>
-                      {model.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="label-text font-semibold">
-                    利用可能なモデル
-                  </span>
-                  <button
-                    className="btn btn-xs"
-                    onClick={refreshAllModels}
-                    disabled={isLoadingRemoteModels}
-                  >
-                    更新
-                  </button>
-                </div>
-
-                <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
-                  {isLoadingRemoteModels ? (
-                    <div className="flex items-center gap-2 text-sm">
-                      <span className="loading loading-spinner loading-xs"></span>
-                      読み込み中...
-                    </div>
-                  ) : remoteModels.length === 0 ? (
-                    <p className="text-sm opacity-60">
-                      利用可能なモデルが見つかりません
-                    </p>
-                  ) : (
-                    remoteModels.map((model) => (
-                      <div
-                        key={model.id}
-                        className="border border-base-300 rounded-xl p-3 flex flex-col gap-2"
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <p className="font-medium text-sm">{model.name}</p>
-                            <p className="text-xs opacity-70">
-                              {model.description}
-                            </p>
-                            <p className="text-xs opacity-60 mt-1">
-                              {formatModelSize(model.size)}
-                            </p>
-                            {model.installed && model.path && (
-                              <p className="text-[11px] opacity-50 mt-1 break-all">
-                                {model.path}
-                              </p>
-                            )}
-                          </div>
-                          <div className="flex flex-row flex-wrap gap-2 items-center justify-end">
-                            {model.installed ? (
-                              <>
-                                <button
-                                  className="btn btn-xs btn-outline text-[11px]"
-                                  disabled={
-                                    selectedModel === model.path ||
-                                    !model.path ||
-                                    modelOperations[model.id]
-                                  }
-                                  onClick={() =>
-                                    model.path && setSelectedModel(model.path)
-                                  }
-                                >
-                                  {selectedModel === model.path
-                                    ? "使用中"
-                                    : "使用する"}
-                                </button>
-                                <button
-                                  className="btn btn-xs btn-error text-[11px]"
-                                  onClick={() => handleDeleteModel(model)}
-                                  disabled={modelOperations[model.id]}
-                                >
-                                  {modelOperations[model.id]
-                                    ? "削除中..."
-                                    : "削除"}
-                                </button>
-                              </>
-                            ) : (
-                              <button
-                                className="btn btn-xs btn-primary text-[11px]"
-                                onClick={() => handleInstallModel(model.id)}
-                                disabled={modelOperations[model.id]}
-                              >
-                                {modelOperations[model.id]
-                                  ? "インストール中..."
-                                  : "インストール"}
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-
-              <div className="form-control">
-                <label className="label">
-                  <span className="label-text">マイク</span>
-                </label>
-                <select
-                  value={selectedAudioDevice}
-                  onChange={(e) => handleAudioDeviceChange(e.target.value)}
-                  className="select select-bordered w-full"
-                >
-                  {audioDevices.map((device) => (
-                    <option key={device.name} value={device.name}>
-                      {device.name}
-                      {device.is_default ? " (デフォルト)" : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="border border-base-300 rounded-xl p-4 space-y-4">
-                <div className="form-control">
-                  <label className="label cursor-pointer">
-                    <span className="label-text">録画/音声を保存</span>
-                    <input
-                      type="checkbox"
-                      className="toggle toggle-primary"
-                      checked={recordingSaveEnabled}
-                      onChange={(e) =>
-                        saveRecordingSaveConfig(
-                          e.target.checked,
-                          recordingSavePath,
-                        )
-                      }
-                    />
-                  </label>
-                </div>
-                {recordingSaveEnabled && (
+            <div className="space-y-3">
+              <details
+                className="collapse collapse-arrow bg-base-200/50 border border-base-300"
+                open
+              >
+                <summary className="collapse-title text-sm font-semibold">
+                  モデル設定
+                </summary>
+                <div className="collapse-content space-y-4">
                   <div className="form-control">
                     <label className="label">
-                      <span className="label-text">保存先フォルダ</span>
+                      <span className="label-text">使用モデル</span>
                     </label>
-                    <input
-                      type="text"
-                      placeholder="/path/to/save/folder"
-                      value={recordingSavePath}
-                      onChange={(e) => setRecordingSavePath(e.target.value)}
-                      onBlur={() =>
-                        saveRecordingSaveConfig(
-                          recordingSaveEnabled,
-                          recordingSavePath,
-                        )
-                      }
-                      className="input input-bordered w-full"
-                    />
+                    <select
+                      value={selectedModel}
+                      onChange={(e) => setSelectedModel(e.target.value)}
+                      className="select select-bordered w-full"
+                    >
+                      {availableModels.map((model) => (
+                        <option key={model.path} value={model.path}>
+                          {model.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="label-text font-semibold">
+                        利用可能なモデル
+                      </span>
+                      <button
+                        className="btn btn-xs"
+                        onClick={refreshAllModels}
+                        disabled={isLoadingRemoteModels}
+                      >
+                        更新
+                      </button>
+                    </div>
+
+                    <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
+                      {isLoadingRemoteModels ? (
+                        <div className="flex items-center gap-2 text-sm">
+                          <span className="loading loading-spinner loading-xs"></span>
+                          読み込み中...
+                        </div>
+                      ) : remoteModels.length === 0 ? (
+                        <p className="text-sm opacity-60">
+                          利用可能なモデルが見つかりません
+                        </p>
+                      ) : (
+                        remoteModels.map((model) => (
+                          <div
+                            key={model.id}
+                            className="border border-base-300 rounded-xl p-3 flex flex-col gap-2"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div>
+                                <p className="font-medium text-sm">
+                                  {model.name}
+                                </p>
+                                <p className="text-xs opacity-70">
+                                  {model.description}
+                                </p>
+                                <p className="text-xs opacity-60 mt-1">
+                                  {formatModelSize(model.size)}
+                                </p>
+                                {model.installed && model.path && (
+                                  <p className="text-[11px] opacity-50 mt-1 break-all">
+                                    {model.path}
+                                  </p>
+                                )}
+                              </div>
+                              <div className="flex flex-row flex-wrap gap-2 items-center justify-end">
+                                {model.installed ? (
+                                  <>
+                                    <button
+                                      className="btn btn-xs btn-outline text-[11px]"
+                                      disabled={
+                                        selectedModel === model.path ||
+                                        !model.path ||
+                                        modelOperations[model.id]
+                                      }
+                                      onClick={() =>
+                                        model.path &&
+                                        setSelectedModel(model.path)
+                                      }
+                                    >
+                                      {selectedModel === model.path
+                                        ? "使用中"
+                                        : "使用する"}
+                                    </button>
+                                    <button
+                                      className="btn btn-xs btn-error text-[11px]"
+                                      onClick={() => handleDeleteModel(model)}
+                                      disabled={modelOperations[model.id]}
+                                    >
+                                      {modelOperations[model.id]
+                                        ? "削除中..."
+                                        : "削除"}
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    className="btn btn-xs btn-primary text-[11px]"
+                                    onClick={() => handleInstallModel(model.id)}
+                                    disabled={modelOperations[model.id]}
+                                  >
+                                    {modelOperations[model.id]
+                                      ? "インストール中..."
+                                      : "インストール"}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </details>
+
+              <details className="collapse collapse-arrow bg-base-200/50 border border-base-300">
+                <summary className="collapse-title text-sm font-semibold">
+                  マイク設定
+                </summary>
+                <div className="collapse-content">
+                  <div className="form-control">
+                    <label className="label">
+                      <span className="label-text">入力デバイス</span>
+                    </label>
+                    <select
+                      value={selectedAudioDevice}
+                      onChange={(e) => handleAudioDeviceChange(e.target.value)}
+                      className="select select-bordered w-full"
+                    >
+                      {audioDevices.map((device) => (
+                        <option key={device.name} value={device.name}>
+                          {device.name}
+                          {device.is_default ? " (デフォルト)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </details>
+
+              <details className="collapse collapse-arrow bg-base-200/50 border border-base-300">
+                <summary className="collapse-title text-sm font-semibold">
+                  録画・保存設定
+                </summary>
+                <div className="collapse-content space-y-4">
+                  <div className="form-control">
+                    <label className="label cursor-pointer">
+                      <span className="label-text">録画/音声を保存</span>
+                      <input
+                        type="checkbox"
+                        className="toggle toggle-primary"
+                        checked={recordingSaveEnabled}
+                        onChange={(e) =>
+                          saveRecordingSaveConfig(
+                            e.target.checked,
+                            recordingSavePath,
+                          )
+                        }
+                      />
+                    </label>
+                  </div>
+                  {recordingSaveEnabled && (
+                    <div className="form-control">
+                      <label className="label">
+                        <span className="label-text">保存先フォルダ</span>
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="/path/to/save/folder"
+                        value={recordingSavePath}
+                        onChange={(e) => setRecordingSavePath(e.target.value)}
+                        onBlur={() =>
+                          saveRecordingSaveConfig(
+                            recordingSaveEnabled,
+                            recordingSavePath,
+                          )
+                        }
+                        className="input input-bordered w-full"
+                      />
+                      <label className="label">
+                        <span className="label-text-alt opacity-70">
+                          録画時はMP4、音声のみの場合はWAVファイルとして保存されます
+                        </span>
+                      </label>
+                    </div>
+                  )}
+
+                  <div className="form-control">
+                    <label className="label cursor-pointer">
+                      <span className="label-text">画面録画を有効化</span>
+                      <input
+                        type="checkbox"
+                        className="toggle toggle-primary"
+                        checked={screenRecordingEnabled}
+                        onChange={(e) =>
+                          saveScreenRecordingConfig(e.target.checked)
+                        }
+                      />
+                    </label>
                     <label className="label">
                       <span className="label-text-alt opacity-70">
-                        録画時はMP4、音声のみの場合はWAVファイルとして保存されます
+                        有効時は録画ボタンで画面+音声を録画、無効時は音声のみ保存
                       </span>
                     </label>
                   </div>
-                )}
-              </div>
+                </div>
+              </details>
 
-              <div className="border border-base-300 rounded-xl p-4 space-y-4">
-                <div className="form-control">
-                  <label className="label cursor-pointer">
-                    <span className="label-text">画面録画を有効化</span>
+              <details className="collapse collapse-arrow bg-base-200/50 border border-base-300">
+                <summary className="collapse-title text-sm font-semibold">
+                  Whisper モデル設定
+                </summary>
+                <div className="collapse-content space-y-4">
+                  <div className="flex items-center justify-between">
+                    <span className="label-text font-semibold">
+                      Whisper モデル設定
+                    </span>
+                    <button
+                      className={`btn btn-xs ${
+                        isSavingWhisperParams ? "btn-disabled" : "btn-primary"
+                      }`}
+                      onClick={() => saveWhisperParams(whisperParams)}
+                      disabled={isSavingWhisperParams}
+                    >
+                      {isSavingWhisperParams ? "保存中..." : "保存"}
+                    </button>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="label">
+                      <span className="label-text">
+                        コンテキスト長 (audio_ctx: {whisperParams.audioCtx})
+                      </span>
+                    </label>
+                    <p className="text-xs opacity-60">
+                      長くするほど過去の音声を参照できますが、計算量とメモリ使用量が増えます。
+                    </p>
                     <input
-                      type="checkbox"
-                      className="toggle toggle-primary"
-                      checked={screenRecordingEnabled}
+                      type="range"
+                      min="50"
+                      max="1500"
+                      step="50"
+                      value={whisperParams.audioCtx}
                       onChange={(e) =>
-                        saveScreenRecordingConfig(e.target.checked)
+                        setWhisperParams((prev) => ({
+                          ...prev,
+                          audioCtx:
+                            parseInt(e.target.value, 10) || prev.audioCtx,
+                        }))
                       }
+                      className="range range-sm range-primary"
                     />
-                  </label>
-                  <label className="label">
-                    <span className="label-text-alt opacity-70">
-                      有効時は録画ボタンで画面+音声を録画、無効時は音声のみ保存
+                    <input
+                      type="number"
+                      min="50"
+                      max="1500"
+                      step="50"
+                      value={whisperParams.audioCtx}
+                      onChange={(e) =>
+                        setWhisperParams((prev) => ({
+                          ...prev,
+                          audioCtx:
+                            parseInt(e.target.value, 10) || prev.audioCtx,
+                        }))
+                      }
+                      className="input input-bordered input-sm w-32"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="label">
+                      <span className="label-text">
+                        温度 (temperature: {whisperParams.temperature.toFixed(2)})
+                      </span>
+                    </label>
+                    <p className="text-xs opacity-60">
+                      数値を上げると出力が多様になります。0に近いほど安定した結果になります。
+                    </p>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={whisperParams.temperature}
+                      onChange={(e) =>
+                        setWhisperParams((prev) => ({
+                          ...prev,
+                          temperature:
+                            parseFloat(e.target.value) ?? prev.temperature,
+                        }))
+                      }
+                      className="range range-sm range-primary"
+                    />
+                    <input
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={whisperParams.temperature}
+                      onChange={(e) =>
+                        setWhisperParams((prev) => ({
+                          ...prev,
+                          temperature:
+                            parseFloat(e.target.value) ?? prev.temperature,
+                        }))
+                      }
+                      className="input input-bordered input-sm w-32"
+                    />
+                  </div>
+                </div>
+              </details>
+
+              <details className="collapse collapse-arrow bg-base-200/50 border border-base-300">
+                <summary className="collapse-title text-sm font-semibold">
+                  ストリーミング設定
+                </summary>
+                <div className="collapse-content space-y-4">
+                  <div className="flex items-center justify-between">
+                    <span className="label-text font-semibold">
+                      ストリーミング設定
                     </span>
-                  </label>
-                </div>
-              </div>
+                    <button
+                      className={`btn btn-xs ${
+                        isSavingStreamingConfig ? "btn-disabled" : "btn-primary"
+                      }`}
+                      onClick={() => saveStreamingConfig(streamingConfig)}
+                      disabled={isSavingStreamingConfig}
+                    >
+                      {isSavingStreamingConfig ? "保存中..." : "保存"}
+                    </button>
+                  </div>
 
-              <div className="border border-base-300 rounded-xl p-4 space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="label-text font-semibold">
-                    Whisper モデル設定
-                  </span>
-                  <button
-                    className={`btn btn-xs ${
-                      isSavingWhisperParams ? "btn-disabled" : "btn-primary"
-                    }`}
-                    onClick={() => saveWhisperParams(whisperParams)}
-                    disabled={isSavingWhisperParams}
-                  >
-                    {isSavingWhisperParams ? "保存中..." : "保存"}
-                  </button>
-                </div>
+                  <div className="space-y-2">
+                    <label className="label">
+                      <span className="label-text">
+                        VAD 閾値 ({streamingConfig.vadThreshold.toFixed(3)})
+                      </span>
+                    </label>
+                    <p className="text-xs opacity-60">
+                      数値が低いほど小さな声でも検知しやすく、高いほど大きな音しか検知しなくなります。
+                    </p>
+                    <input
+                      type="range"
+                      min="0.01"
+                      max="0.99"
+                      step="0.01"
+                      value={streamingConfig.vadThreshold}
+                      onChange={(e) =>
+                        setStreamingConfig((prev) => ({
+                          ...prev,
+                          vadThreshold: parseFloat(e.target.value),
+                        }))
+                      }
+                      className="range range-sm range-primary"
+                    />
+                    <input
+                      type="number"
+                      min="0.01"
+                      max="0.99"
+                      step="0.01"
+                      value={streamingConfig.vadThreshold}
+                      onChange={(e) =>
+                        setStreamingConfig((prev) => ({
+                          ...prev,
+                          vadThreshold: parseFloat(e.target.value) || 0.1,
+                        }))
+                      }
+                      className="input input-bordered input-sm w-32"
+                    />
+                  </div>
 
-                <div className="space-y-2">
-                  <label className="label">
-                    <span className="label-text">
-                      コンテキスト長 (audio_ctx: {whisperParams.audioCtx})
-                    </span>
-                  </label>
-                  <p className="text-xs opacity-60">
-                    長くするほど過去の音声を参照できますが、計算量とメモリ使用量が増えます。
-                  </p>
-                  <input
-                    type="range"
-                    min="50"
-                    max="1500"
-                    step="50"
-                    value={whisperParams.audioCtx}
-                    onChange={(e) =>
-                      setWhisperParams((prev) => ({
-                        ...prev,
-                        audioCtx: parseInt(e.target.value, 10) || prev.audioCtx,
-                      }))
-                    }
-                    className="range range-sm range-primary"
-                  />
-                  <input
-                    type="number"
-                    min="50"
-                    max="1500"
-                    step="50"
-                    value={whisperParams.audioCtx}
-                    onChange={(e) =>
-                      setWhisperParams((prev) => ({
-                        ...prev,
-                        audioCtx: parseInt(e.target.value, 10) || prev.audioCtx,
-                      }))
-                    }
-                    className="input input-bordered input-sm w-32"
-                  />
+                  <div className="space-y-2">
+                    <label className="label">
+                      <span className="label-text">文字起こし間隔 (秒)</span>
+                    </label>
+                    <p className="text-xs opacity-60">
+                      短くすると小刻みに更新され、長くするとまとまった文章で届きます。
+                    </p>
+                    <input
+                      type="range"
+                      min="0.5"
+                      max="30"
+                      step="0.5"
+                      value={streamingConfig.partialIntervalSeconds}
+                      onChange={(e) =>
+                        setStreamingConfig((prev) => ({
+                          ...prev,
+                          partialIntervalSeconds: parseFloat(e.target.value),
+                        }))
+                      }
+                      className="range range-sm range-primary"
+                    />
+                    <input
+                      type="number"
+                      min="0.5"
+                      max="30"
+                      step="0.5"
+                      value={streamingConfig.partialIntervalSeconds}
+                      onChange={(e) =>
+                        setStreamingConfig((prev) => ({
+                          ...prev,
+                          partialIntervalSeconds:
+                            parseFloat(e.target.value) || 4,
+                        }))
+                      }
+                      className="input input-bordered input-sm w-32"
+                    />
+                  </div>
                 </div>
-
-                <div className="space-y-2">
-                  <label className="label">
-                    <span className="label-text">
-                      温度 (temperature: {whisperParams.temperature.toFixed(2)})
-                    </span>
-                  </label>
-                  <p className="text-xs opacity-60">
-                    数値を上げると出力が多様になります。0に近いほど安定した結果になります。
-                  </p>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={whisperParams.temperature}
-                    onChange={(e) =>
-                      setWhisperParams((prev) => ({
-                        ...prev,
-                        temperature:
-                          parseFloat(e.target.value) ?? prev.temperature,
-                      }))
-                    }
-                    className="range range-sm range-primary"
-                  />
-                  <input
-                    type="number"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={whisperParams.temperature}
-                    onChange={(e) =>
-                      setWhisperParams((prev) => ({
-                        ...prev,
-                        temperature:
-                          parseFloat(e.target.value) ?? prev.temperature,
-                      }))
-                    }
-                    className="input input-bordered input-sm w-32"
-                  />
-                </div>
-              </div>
-
-              <div className="border border-base-300 rounded-xl p-4 space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="label-text font-semibold">
-                    ストリーミング設定
-                  </span>
-                  <button
-                    className={`btn btn-xs ${
-                      isSavingStreamingConfig ? "btn-disabled" : "btn-primary"
-                    }`}
-                    onClick={() => saveStreamingConfig(streamingConfig)}
-                    disabled={isSavingStreamingConfig}
-                  >
-                    {isSavingStreamingConfig ? "保存中..." : "保存"}
-                  </button>
-                </div>
-
-                <div className="space-y-2">
-                  <label className="label">
-                    <span className="label-text">
-                      VAD 閾値 ({streamingConfig.vadThreshold.toFixed(3)})
-                    </span>
-                  </label>
-                  <p className="text-xs opacity-60">
-                    数値が低いほど小さな声でも検知しやすく、高いほど大きな音しか検知しなくなります。
-                  </p>
-                  <input
-                    type="range"
-                    min="0.01"
-                    max="0.99"
-                    step="0.01"
-                    value={streamingConfig.vadThreshold}
-                    onChange={(e) =>
-                      setStreamingConfig((prev) => ({
-                        ...prev,
-                        vadThreshold: parseFloat(e.target.value),
-                      }))
-                    }
-                    className="range range-sm range-primary"
-                  />
-                  <input
-                    type="number"
-                    min="0.01"
-                    max="0.99"
-                    step="0.01"
-                    value={streamingConfig.vadThreshold}
-                    onChange={(e) =>
-                      setStreamingConfig((prev) => ({
-                        ...prev,
-                        vadThreshold: parseFloat(e.target.value) || 0.1,
-                      }))
-                    }
-                    className="input input-bordered input-sm w-32"
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <label className="label">
-                    <span className="label-text">文字起こし間隔 (秒)</span>
-                  </label>
-                  <p className="text-xs opacity-60">
-                    短くすると小刻みに更新され、長くするとまとまった文章で届きます。
-                  </p>
-                  <input
-                    type="range"
-                    min="0.5"
-                    max="30"
-                    step="0.5"
-                    value={streamingConfig.partialIntervalSeconds}
-                    onChange={(e) =>
-                      setStreamingConfig((prev) => ({
-                        ...prev,
-                        partialIntervalSeconds: parseFloat(e.target.value),
-                      }))
-                    }
-                    className="range range-sm range-primary"
-                  />
-                  <input
-                    type="number"
-                    min="0.5"
-                    max="30"
-                    step="0.5"
-                    value={streamingConfig.partialIntervalSeconds}
-                    onChange={(e) =>
-                      setStreamingConfig((prev) => ({
-                        ...prev,
-                        partialIntervalSeconds: parseFloat(e.target.value) || 4,
-                      }))
-                    }
-                    className="input input-bordered input-sm w-32"
-                  />
-                </div>
-              </div>
+              </details>
 
               {hasMicPermission === false && (
                 <div className="alert alert-warning">
