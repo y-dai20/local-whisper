@@ -10,6 +10,7 @@ import {
   Circle,
   StopCircle,
   Copy,
+  Check,
   Trash2,
   Moon,
   Sun,
@@ -98,6 +99,7 @@ function App() {
   const [playingSessionKey, setPlayingSessionKey] = useState<string | null>(
     null,
   );
+  const [copiedSessionKey, setCopiedSessionKey] = useState<string | null>(null);
   const [currentAudioSource, setCurrentAudioSource] =
     useState<AudioBufferSourceNode | null>(null);
   const [currentAudioContext, setCurrentAudioContext] =
@@ -136,6 +138,7 @@ function App() {
     system: { isActive: false, sessionId: null },
   });
   const transcriptionSuppressedForPlaybackRef = useRef(false);
+  const copyFeedbackTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
@@ -796,6 +799,33 @@ function App() {
     setTranscriptions([]);
   };
 
+  const handleCopySessionText = async (
+    sessionKey: string,
+    sessionText: string,
+  ) => {
+    try {
+      await navigator.clipboard.writeText(sessionText);
+      setCopiedSessionKey(sessionKey);
+      if (copyFeedbackTimeoutRef.current) {
+        window.clearTimeout(copyFeedbackTimeoutRef.current);
+      }
+      copyFeedbackTimeoutRef.current = window.setTimeout(() => {
+        setCopiedSessionKey(null);
+        copyFeedbackTimeoutRef.current = null;
+      }, 1500);
+    } catch (err) {
+      setError(`コピーエラー: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (copyFeedbackTimeoutRef.current) {
+        window.clearTimeout(copyFeedbackTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const playSessionAudio = async (audioData: number[], sessionKey: string) => {
     if (audioData.length === 0) {
       return;
@@ -1057,12 +1087,20 @@ function App() {
                     <div className="chat-footer opacity-50 flex justify-between items-center mt-1">
                       <button
                         onClick={() =>
-                          navigator.clipboard.writeText(sessionText)
+                          handleCopySessionText(session.sessionKey, sessionText)
                         }
                         className="btn btn-ghost btn-xs btn-circle"
-                        title="コピー"
+                        title={
+                          copiedSessionKey === session.sessionKey
+                            ? "コピー完了"
+                            : "コピー"
+                        }
                       >
-                        <Copy className="w-3 h-3" />
+                        {copiedSessionKey === session.sessionKey ? (
+                          <Check className="w-3 h-3" />
+                        ) : (
+                          <Copy className="w-3 h-3" />
+                        )}
                       </button>
                       {sessionAudio.length > 0 && (
                         <button
