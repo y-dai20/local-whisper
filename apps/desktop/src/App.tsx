@@ -829,7 +829,7 @@ function App() {
 
   const isPendingVoiceSession = (source: VoiceSource) => {
     const state = voiceActivity[source];
-    if (!state.isActive || !state.sessionId) {
+    if (!state.isActive || state.sessionId === null) {
       return false;
     }
     if (
