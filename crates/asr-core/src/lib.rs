@@ -1,5 +1,8 @@
 use std::borrow::Cow;
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_void};
 use std::path::Path;
+use std::sync::Once;
 use std::time::Instant;
 use thiserror::Error;
 use whisper_rs::{
@@ -9,6 +12,30 @@ use whisper_rs::{
 const WHISPER_SAMPLE_RATE: usize = 16_000;
 const MIN_AUDIO_DURATION_S: usize = 2;
 const MIN_AUDIO_SAMPLES: usize = WHISPER_SAMPLE_RATE * MIN_AUDIO_DURATION_S;
+static WHISPER_LOG_INIT: Once = Once::new();
+
+unsafe extern "C" fn whisper_log_filter_callback(
+    level: u32,
+    text: *const c_char,
+    _user_data: *mut c_void,
+) {
+    if text.is_null() {
+        return;
+    }
+
+    let msg = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+
+    // Suppress verbose decoder traces such as:
+    // "whisper_full_with_state: id = ..."
+    if msg.contains("whisper_full_with_state") {
+        return;
+    }
+
+    // Keep only warning/error messages from whisper.cpp.
+    if level <= 3 {
+        eprint!("{msg}");
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct WhisperParams {
@@ -66,6 +93,10 @@ pub struct TranscribedWord {
 
 impl WhisperContext {
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self, WhisperError> {
+        WHISPER_LOG_INIT.call_once(|| unsafe {
+            whisper_rs::set_log_callback(Some(whisper_log_filter_callback), std::ptr::null_mut());
+        });
+
         let mut ctx_params = WhisperContextParameters::default();
         ctx_params.use_gpu(true).flash_attn(true);
 
