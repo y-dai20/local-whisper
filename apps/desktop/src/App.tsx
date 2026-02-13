@@ -10,6 +10,7 @@ import {
   Circle,
   StopCircle,
   Copy,
+  Trash2,
   Moon,
   Sun,
   MessageSquare,
@@ -774,6 +775,11 @@ function App() {
     setPlayingSessionKey(null);
   };
 
+  const clearAllMessages = () => {
+    stopAudio();
+    setTranscriptions([]);
+  };
+
   const playSessionAudio = (audioData: number[], sessionKey: string) => {
     if (audioData.length === 0) {
       return;
@@ -851,6 +857,18 @@ function App() {
         data-tauri-drag-region
         className="app-header bg-base-100 border-b border-base-200 flex items-center py-1 px-4 gap-4"
       >
+        <div className="shrink-0">
+          <button
+            className="btn btn-ghost btn-sm btn-square"
+            onClick={clearAllMessages}
+            disabled={transcriptions.length === 0}
+            title="メッセージをクリア"
+            aria-label="メッセージをクリア"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+        </div>
+
         <div className="flex-1"></div>
 
         <div className="flex items-center gap-2 shrink-0">
