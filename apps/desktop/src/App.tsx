@@ -85,7 +85,6 @@ interface WhisperParamsConfig {
 
 interface TranscriptionBackendConfig {
   mode: "local" | "api";
-  apiBaseUrl: string;
 }
 
 interface ApiTranscriptEvent {
@@ -95,6 +94,15 @@ interface ApiTranscriptEvent {
   is_final: boolean;
   created_at: string;
 }
+
+interface SummaryResponse {
+  summary?: string;
+  text?: string;
+  result?: string;
+}
+
+const API_BASE_URL =
+  (import.meta.env.VITE_ASR_API_BASE_URL as string | undefined)?.trim() || "";
 
 function App() {
   const [isMuted, setIsMuted] = useState(true);
@@ -146,11 +154,11 @@ function App() {
   const [isRecordingActive, setIsRecordingActive] = useState(false);
   const [isRecordingBusy, setIsRecordingBusy] = useState(false);
   const [isMicBusy, setIsMicBusy] = useState(false);
+  const [isSummarizing, setIsSummarizing] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
   const [transcriptionMode, setTranscriptionMode] = useState<"local" | "api">(
     "local",
   );
-  const [apiBaseUrl, setApiBaseUrl] = useState("");
   const [copiedAllHistory, setCopiedAllHistory] = useState(false);
   const [voiceActivity, setVoiceActivity] = useState<VoiceActivityState>({
     user: { isActive: false, sessionId: null },
@@ -258,7 +266,6 @@ function App() {
         "get_transcription_backend_config",
       );
       setTranscriptionMode(config.mode);
-      setApiBaseUrl(config.apiBaseUrl);
     } catch (err) {
       console.error("Failed to load transcription backend config:", err);
     }
@@ -267,9 +274,13 @@ function App() {
   const saveTranscriptionBackendConfig = useCallback(
     async (config: TranscriptionBackendConfig) => {
       try {
-        await invoke("set_transcription_backend_config", { config });
-        setTranscriptionMode(config.mode);
-        setApiBaseUrl(config.apiBaseUrl);
+        const normalizedConfig: TranscriptionBackendConfig = {
+          mode: config.mode,
+        };
+        await invoke("set_transcription_backend_config", {
+          config: normalizedConfig,
+        });
+        setTranscriptionMode(normalizedConfig.mode);
       } catch (err) {
         console.error("Failed to save transcription backend config:", err);
         setError(
@@ -719,8 +730,88 @@ function App() {
 
     await saveTranscriptionBackendConfig({
       mode: nextMode,
-      apiBaseUrl,
     });
+  };
+
+  const appendSummaryMessage = (summaryText: string) => {
+    const now = Date.now();
+    const summarySegment: TranscriptionSegment = {
+      text: summaryText,
+      timestamp: now,
+      sessionId: now,
+      messageId: 0,
+      isFinal: true,
+      source: "system",
+    };
+
+    setTranscriptions((prev) => [
+      ...prev,
+      {
+        sessionKey: `system-${summarySegment.sessionId}`,
+        sessionId: summarySegment.sessionId,
+        source: "system",
+        messages: [summarySegment],
+        audioChunks: {},
+      },
+    ]);
+  };
+
+  const summarizeCurrentSession = async () => {
+    if (isSummarizing || transcriptionMode !== "api") {
+      return;
+    }
+
+    const latestSession =
+      transcriptions.length > 0
+        ? transcriptions[transcriptions.length - 1]
+        : undefined;
+    if (!latestSession || latestSession.messages.length === 0) {
+      setError("要約対象のセッションがありません");
+      return;
+    }
+
+    const text = latestSession.messages
+      .map((m: TranscriptionSegment) => m.text)
+      .join("\n")
+      .trim();
+    if (!text) {
+      setError("要約対象のテキストがありません");
+      return;
+    }
+
+    setIsSummarizing(true);
+    try {
+      const baseUrl = API_BASE_URL.replace(/\/$/, "");
+      const response = await fetch(`${baseUrl}/api/summarize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          session_id: latestSession.sessionId,
+          source: latestSession.source,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Summary request failed: ${response.status}`);
+      }
+
+      const payload = (await response.json()) as SummaryResponse;
+      const summary = payload.summary ?? payload.text ?? payload.result ?? "";
+      if (!summary.trim()) {
+        throw new Error("Summary response is empty");
+      }
+
+      appendSummaryMessage(summary.trim());
+      setError("");
+    } catch (err) {
+      console.error("Failed to summarize session:", err);
+      setError(
+        `要約エラー: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setIsSummarizing(false);
+    }
   };
 
   const refreshAllModels = async () => {
@@ -961,7 +1052,7 @@ function App() {
     apiDraftMessageIdRef.current = null;
 
     if (sessionId) {
-      const baseUrl = apiBaseUrl.replace(/\/$/, "");
+      const baseUrl = API_BASE_URL.replace(/\/$/, "");
       const closeController = new AbortController();
       const closeTimeout = window.setTimeout(
         () => closeController.abort(),
@@ -982,7 +1073,7 @@ function App() {
 
   const startApiMic = async () => {
     try {
-      const baseUrl = apiBaseUrl.replace(/\/$/, "");
+      const baseUrl = API_BASE_URL.replace(/\/$/, "");
       const mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: true,
       });
@@ -1418,28 +1509,30 @@ function App() {
         </div>
 
         <div className="shrink-0 flex items-center gap-2">
-          <span className="text-xs opacity-70">モード</span>
-          <div className="join">
-            <button
-              className={`join-item btn btn-xs ${
-                transcriptionMode === "local" ? "btn-primary" : "btn-ghost"
-              }`}
-              onClick={() => void handleTranscriptionModeChange("local")}
-              title="ローカルモード"
-            >
-              Local
-            </button>
-            <button
-              className={`join-item btn btn-xs ${
-                transcriptionMode === "api" ? "btn-primary" : "btn-ghost"
-              }`}
-              onClick={() => void handleTranscriptionModeChange("api")}
-              title="APIモード"
-            >
-              API
-            </button>
-          </div>
+          <input
+            type="checkbox"
+            className="toggle toggle-primary toggle-sm"
+            checked={transcriptionMode === "api"}
+            onChange={(e) =>
+              void handleTranscriptionModeChange(
+                e.target.checked ? "api" : "local",
+              )
+            }
+            title="Pro モード切替"
+          />
+          <span className="text-xs font-semibold text-primary">Pro</span>
         </div>
+
+        {transcriptionMode === "api" && (
+          <button
+            className={`btn btn-ghost btn-sm ${isSummarizing ? "btn-disabled" : ""}`}
+            onClick={summarizeCurrentSession}
+            disabled={isSummarizing || transcriptions.length === 0}
+            title="今のセッションを要約"
+          >
+            {isSummarizing ? "要約中..." : "要約"}
+          </button>
+        )}
 
         <div className="flex-1"></div>
 
@@ -1785,30 +1878,6 @@ function App() {
                 </summary>
                 <div className="collapse-content">
                   <div className="space-y-4">
-                    <div className="form-control">
-                      <label className="label">
-                        <span className="label-text">APIサーバーURL</span>
-                      </label>
-                      <input
-                        type="text"
-                        value={apiBaseUrl}
-                        onChange={(e) => setApiBaseUrl(e.target.value)}
-                        onBlur={() =>
-                          saveTranscriptionBackendConfig({
-                            mode: transcriptionMode,
-                            apiBaseUrl,
-                          })
-                        }
-                        className="input input-bordered w-full"
-                        placeholder="http://127.0.0.1:8000"
-                      />
-                      <label className="label">
-                        <span className="label-text-alt opacity-70">
-                          APIモード時に /api/webrtc/offer へ接続します
-                        </span>
-                      </label>
-                    </div>
-
                     <div className="form-control">
                       <label className="label">
                         <span className="label-text">入力デバイス</span>
