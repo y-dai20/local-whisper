@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 mod audio;
 mod commands;
@@ -597,9 +597,13 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .on_window_event(|_window, event| {
-            if let WindowEvent::CloseRequested { .. } = event {
-                cleanup_on_exit();
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Keep app running in background when the user clicks the close button.
+                api.prevent_close();
+                if let Err(err) = window.hide() {
+                    error!("Failed to hide window on close request: {}", err);
+                }
             }
         })
         .setup(|app| {
@@ -608,7 +612,32 @@ pub fn run() {
         });
 
     let app = commands::register(app);
+    let app = app
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
 
-    app.run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    app.run(|app_handle, event| {
+        match event {
+            tauri::RunEvent::Exit => cleanup_on_exit(),
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } => {
+                if !has_visible_windows {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        if let Err(err) = window.show() {
+                            error!("Failed to show main window on reopen: {}", err);
+                        }
+                        if let Err(err) = window.set_focus() {
+                            error!("Failed to focus main window on reopen: {}", err);
+                        }
+                    } else {
+                        error!("Main window not found on reopen event");
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
 }
