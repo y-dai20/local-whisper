@@ -133,12 +133,14 @@ function App() {
   const [isRecordingActive, setIsRecordingActive] = useState(false);
   const [isRecordingBusy, setIsRecordingBusy] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
+  const [copiedAllHistory, setCopiedAllHistory] = useState(false);
   const [voiceActivity, setVoiceActivity] = useState<VoiceActivityState>({
     user: { isActive: false, sessionId: null },
     system: { isActive: false, sessionId: null },
   });
   const transcriptionSuppressedForPlaybackRef = useRef(false);
   const copyFeedbackTimeoutRef = useRef<number | null>(null);
+  const copyAllFeedbackTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
@@ -814,7 +816,65 @@ function App() {
         copyFeedbackTimeoutRef.current = null;
       }, 1500);
     } catch (err) {
-      setError(`コピーエラー: ${err instanceof Error ? err.message : String(err)}`);
+      setError(
+        `コピーエラー: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
+  const formatSegmentTimestamp = (timestamp: number) => {
+    const millis = timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
+    return new Date(millis).toLocaleString("ja-JP", {
+      hour12: false,
+    });
+  };
+
+  const handleCopyAllHistory = async () => {
+    if (transcriptions.length === 0) {
+      return;
+    }
+
+    const allMessages = transcriptions
+      .flatMap((session) =>
+        session.messages.map((message) => ({
+          timestamp: message.timestamp,
+          sender: message.source,
+          text: message.text,
+          sessionId: message.sessionId,
+          messageId: message.messageId,
+        })),
+      )
+      .sort((a, b) => {
+        if (a.timestamp !== b.timestamp) {
+          return a.timestamp - b.timestamp;
+        }
+        if (a.sessionId !== b.sessionId) {
+          return a.sessionId - b.sessionId;
+        }
+        return a.messageId - b.messageId;
+      });
+
+    const exportText = allMessages
+      .map(
+        (message) =>
+          `[${formatSegmentTimestamp(message.timestamp)}] ${message.sender}: ${message.text}`,
+      )
+      .join("\n");
+
+    try {
+      await navigator.clipboard.writeText(exportText);
+      setCopiedAllHistory(true);
+      if (copyAllFeedbackTimeoutRef.current) {
+        window.clearTimeout(copyAllFeedbackTimeoutRef.current);
+      }
+      copyAllFeedbackTimeoutRef.current = window.setTimeout(() => {
+        setCopiedAllHistory(false);
+        copyAllFeedbackTimeoutRef.current = null;
+      }, 1500);
+    } catch (err) {
+      setError(
+        `履歴コピーエラー: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   };
 
@@ -822,6 +882,9 @@ function App() {
     return () => {
       if (copyFeedbackTimeoutRef.current) {
         window.clearTimeout(copyFeedbackTimeoutRef.current);
+      }
+      if (copyAllFeedbackTimeoutRef.current) {
+        window.clearTimeout(copyAllFeedbackTimeoutRef.current);
       }
     };
   }, []);
@@ -881,7 +944,10 @@ function App() {
               transcriptionSuppressedForPlaybackRef.current = false;
             })
             .catch((err) => {
-              console.error("Failed to disable transcription suppression:", err);
+              console.error(
+                "Failed to disable transcription suppression:",
+                err,
+              );
               setError(
                 `文字起こし再開エラー: ${
                   err instanceof Error ? err.message : String(err)
@@ -943,7 +1009,7 @@ function App() {
         data-tauri-drag-region
         className="app-header bg-base-100 border-b border-base-200 flex items-center py-1 px-4 gap-4"
       >
-        <div className="shrink-0">
+        <div className="shrink-0 flex items-center gap-1">
           <button
             className="btn btn-ghost btn-sm btn-square"
             onClick={clearAllMessages}
@@ -952,6 +1018,19 @@ function App() {
             aria-label="メッセージをクリア"
           >
             <Trash2 className="w-4 h-4" />
+          </button>
+          <button
+            className="btn btn-ghost btn-sm btn-square"
+            onClick={handleCopyAllHistory}
+            disabled={transcriptions.length === 0}
+            title={copiedAllHistory ? "履歴コピー完了" : "履歴をすべてコピー"}
+            aria-label="履歴をすべてコピー"
+          >
+            {copiedAllHistory ? (
+              <Check className="w-4 h-4" />
+            ) : (
+              <Copy className="w-4 h-4" />
+            )}
           </button>
         </div>
 
@@ -1448,7 +1527,8 @@ function App() {
                   <div className="space-y-2">
                     <label className="label">
                       <span className="label-text">
-                        温度 (temperature: {whisperParams.temperature.toFixed(2)})
+                        温度 (temperature:{" "}
+                        {whisperParams.temperature.toFixed(2)})
                       </span>
                     </label>
                     <p className="text-xs opacity-60">
