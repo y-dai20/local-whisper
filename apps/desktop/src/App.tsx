@@ -15,6 +15,9 @@ import {
   Moon,
   Sun,
   MessageSquare,
+  ChevronDown,
+  ChevronUp,
+  X,
 } from "lucide-react";
 import "./App.css";
 
@@ -155,6 +158,8 @@ function App() {
   const [isRecordingBusy, setIsRecordingBusy] = useState(false);
   const [isMicBusy, setIsMicBusy] = useState(false);
   const [isSummarizing, setIsSummarizing] = useState(false);
+  const [summaryPanelText, setSummaryPanelText] = useState<string | null>(null);
+  const [isSummaryExpanded, setIsSummaryExpanded] = useState(true);
   const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
   const [transcriptionMode, setTranscriptionMode] = useState<"local" | "api">(
     "local",
@@ -733,29 +738,6 @@ function App() {
     });
   };
 
-  const appendSummaryMessage = (summaryText: string) => {
-    const now = Date.now();
-    const summarySegment: TranscriptionSegment = {
-      text: summaryText,
-      timestamp: now,
-      sessionId: now,
-      messageId: 0,
-      isFinal: true,
-      source: "system",
-    };
-
-    setTranscriptions((prev) => [
-      ...prev,
-      {
-        sessionKey: `system-${summarySegment.sessionId}`,
-        sessionId: summarySegment.sessionId,
-        source: "system",
-        messages: [summarySegment],
-        audioChunks: {},
-      },
-    ]);
-  };
-
   const summarizeCurrentSession = async () => {
     if (isSummarizing || transcriptionMode !== "api") {
       return;
@@ -802,7 +784,8 @@ function App() {
         throw new Error("Summary response is empty");
       }
 
-      appendSummaryMessage(summary.trim());
+      setSummaryPanelText(summary.trim());
+      setIsSummaryExpanded(true);
       setError("");
     } catch (err) {
       console.error("Failed to summarize session:", err);
@@ -1605,8 +1588,50 @@ function App() {
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 overflow-y-auto p-4">
-        <div className="max-w-3xl mx-auto space-y-3">
+      <main className="relative flex-1 overflow-hidden p-4">
+        {summaryPanelText && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 w-[calc(100%-2rem)] max-w-3xl z-20">
+            <div className="bg-base-200 border border-base-300 rounded-xl shadow-sm">
+              <div className="px-3 py-2 flex items-center justify-between">
+                <span className="text-sm font-medium">要約</span>
+                <div className="flex items-center gap-1">
+                  <button
+                    className="btn btn-ghost btn-xs btn-square"
+                    onClick={() => setIsSummaryExpanded((prev) => !prev)}
+                    title={isSummaryExpanded ? "折りたたむ" : "展開する"}
+                    aria-label={isSummaryExpanded ? "折りたたむ" : "展開する"}
+                  >
+                    {isSummaryExpanded ? (
+                      <ChevronUp className="w-4 h-4" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4" />
+                    )}
+                  </button>
+                  <button
+                    className="btn btn-ghost btn-xs btn-square"
+                    onClick={() => setSummaryPanelText(null)}
+                    title="閉じる"
+                    aria-label="閉じる"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+              {isSummaryExpanded && (
+                <div className="px-3 pb-3 text-sm whitespace-pre-wrap leading-relaxed border-t border-base-300/70">
+                  {summaryPanelText}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="h-full overflow-y-auto">
+          <div
+            className={`max-w-3xl mx-auto space-y-3 ${
+              summaryPanelText ? (isSummaryExpanded ? "pt-32" : "pt-16") : ""
+            }`}
+          >
           {error && (
             <div className="alert alert-error">
               <span className="text-sm">{error}</span>
@@ -1727,6 +1752,7 @@ function App() {
               <div ref={messagesEndRef} />
             </div>
           )}
+          </div>
         </div>
       </main>
 
