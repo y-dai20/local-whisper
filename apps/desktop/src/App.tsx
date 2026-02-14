@@ -169,6 +169,8 @@ function App() {
     user: { isActive: false, sessionId: null },
     system: { isActive: false, sessionId: null },
   });
+  const [newMessageCount, setNewMessageCount] = useState(0);
+  const [isAutoScrollPaused, setIsAutoScrollPaused] = useState(false);
   const transcriptionSuppressedForPlaybackRef = useRef(false);
   const copyFeedbackTimeoutRef = useRef<number | null>(null);
   const copyAllFeedbackTimeoutRef = useRef<number | null>(null);
@@ -178,6 +180,8 @@ function App() {
   const apiSessionServerIdRef = useRef<string | null>(null);
   const apiSessionLocalIdRef = useRef<number | null>(null);
   const apiDraftMessageIdRef = useRef<number | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const previousMessageCountRef = useRef(0);
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
@@ -626,9 +630,50 @@ function App() {
     };
   }, [loadStreamingConfig, loadWhisperParams, loadTranscriptionBackendConfig]);
 
+  const getTotalMessageCount = useCallback(
+    (sessions: SessionTranscription[]) =>
+      sessions.reduce((total, session) => total + session.messages.length, 0),
+    [],
+  );
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  }, []);
+
+  const handleScrollContainer = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const distanceFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight;
+    const shouldPauseAutoScroll = distanceFromBottom > container.clientHeight;
+
+    setIsAutoScrollPaused(shouldPauseAutoScroll);
+
+    if (!shouldPauseAutoScroll) {
+      setNewMessageCount(0);
+    }
+  }, []);
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcriptions]);
+    const currentCount = getTotalMessageCount(transcriptions);
+    const previousCount = previousMessageCountRef.current;
+    const incomingCount = Math.max(0, currentCount - previousCount);
+    previousMessageCountRef.current = currentCount;
+
+    if (incomingCount === 0) {
+      return;
+    }
+
+    if (isAutoScrollPaused) {
+      setNewMessageCount((prev) => prev + incomingCount);
+      return;
+    }
+
+    scrollToBottom("smooth");
+  }, [getTotalMessageCount, isAutoScrollPaused, scrollToBottom, transcriptions]);
 
   useEffect(() => {
     if (selectedModel) {
@@ -1626,7 +1671,11 @@ function App() {
           </div>
         )}
 
-        <div className="h-full overflow-y-auto">
+        <div
+          ref={scrollContainerRef}
+          onScroll={handleScrollContainer}
+          className="h-full overflow-y-auto"
+        >
           <div
             className={`max-w-3xl mx-auto space-y-3 ${
               summaryPanelText ? (isSummaryExpanded ? "pt-32" : "pt-16") : ""
@@ -1757,6 +1806,21 @@ function App() {
             )}
           </div>
         </div>
+
+        {newMessageCount > 0 && (
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30">
+            <button
+              className="btn btn-ghost btn-sm border border-base-300 bg-base-100/95 text-base-content shadow-md"
+              onClick={() => {
+                scrollToBottom("smooth");
+                setNewMessageCount(0);
+                setIsAutoScrollPaused(false);
+              }}
+            >
+              新規メッセージ {newMessageCount}件
+            </button>
+          </div>
+        )}
       </main>
 
       {/* Settings Modal */}
