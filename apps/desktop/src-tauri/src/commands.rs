@@ -87,6 +87,16 @@ async fn set_streaming_config(config: StreamingConfig) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn get_transcription_backend_config() -> Result<TranscriptionBackendConfig, String> {
+    crate::get_transcription_backend_config_impl().await
+}
+
+#[tauri::command]
+async fn set_transcription_backend_config(config: TranscriptionBackendConfig) -> Result<(), String> {
+    crate::set_transcription_backend_config_impl(config).await
+}
+
+#[tauri::command]
 async fn check_microphone_permission() -> Result<bool, String> {
     crate::check_microphone_permission_impl().await
 }
@@ -170,6 +180,8 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         select_audio_device,
         get_streaming_config,
         set_streaming_config,
+        get_transcription_backend_config,
+        set_transcription_backend_config,
         check_microphone_permission,
         start_system_audio,
         stop_system_audio,

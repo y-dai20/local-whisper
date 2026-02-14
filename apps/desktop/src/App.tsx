@@ -83,6 +83,19 @@ interface WhisperParamsConfig {
   temperature: number;
 }
 
+interface TranscriptionBackendConfig {
+  mode: "local" | "api";
+  apiBaseUrl: string;
+}
+
+interface ApiTranscriptEvent {
+  session_id: string;
+  chunk_index: number;
+  text: string;
+  is_final: boolean;
+  created_at: string;
+}
+
 function App() {
   const [isMuted, setIsMuted] = useState(true);
   const [isInitialized, setIsInitialized] = useState(false);
@@ -132,7 +145,12 @@ function App() {
   const [screenRecordingEnabled, setScreenRecordingEnabled] = useState(false);
   const [isRecordingActive, setIsRecordingActive] = useState(false);
   const [isRecordingBusy, setIsRecordingBusy] = useState(false);
+  const [isMicBusy, setIsMicBusy] = useState(false);
   const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
+  const [transcriptionMode, setTranscriptionMode] = useState<"local" | "api">(
+    "local",
+  );
+  const [apiBaseUrl, setApiBaseUrl] = useState("");
   const [copiedAllHistory, setCopiedAllHistory] = useState(false);
   const [voiceActivity, setVoiceActivity] = useState<VoiceActivityState>({
     user: { isActive: false, sessionId: null },
@@ -141,6 +159,12 @@ function App() {
   const transcriptionSuppressedForPlaybackRef = useRef(false);
   const copyFeedbackTimeoutRef = useRef<number | null>(null);
   const copyAllFeedbackTimeoutRef = useRef<number | null>(null);
+  const apiPeerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const apiLocalStreamRef = useRef<MediaStream | null>(null);
+  const apiEventsSocketRef = useRef<WebSocket | null>(null);
+  const apiSessionServerIdRef = useRef<string | null>(null);
+  const apiSessionLocalIdRef = useRef<number | null>(null);
+  const apiDraftMessageIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
@@ -223,6 +247,36 @@ function App() {
         );
       } finally {
         setIsSavingWhisperParams(false);
+      }
+    },
+    [setError],
+  );
+
+  const loadTranscriptionBackendConfig = useCallback(async () => {
+    try {
+      const config = await invoke<TranscriptionBackendConfig>(
+        "get_transcription_backend_config",
+      );
+      setTranscriptionMode(config.mode);
+      setApiBaseUrl(config.apiBaseUrl);
+    } catch (err) {
+      console.error("Failed to load transcription backend config:", err);
+    }
+  }, []);
+
+  const saveTranscriptionBackendConfig = useCallback(
+    async (config: TranscriptionBackendConfig) => {
+      try {
+        await invoke("set_transcription_backend_config", { config });
+        setTranscriptionMode(config.mode);
+        setApiBaseUrl(config.apiBaseUrl);
+      } catch (err) {
+        console.error("Failed to save transcription backend config:", err);
+        setError(
+          `文字起こしバックエンド設定エラー: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
       }
     },
     [setError],
@@ -548,12 +602,13 @@ function App() {
     loadWhisperParams();
     loadRecordingSaveConfig();
     loadScreenRecordingConfig();
+    loadTranscriptionBackendConfig();
 
     return () => {
       unlistenTranscription.then((fn) => fn());
       unlistenVoiceActivity.then((fn) => fn());
     };
-  }, [loadStreamingConfig, loadWhisperParams]);
+  }, [loadStreamingConfig, loadWhisperParams, loadTranscriptionBackendConfig]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -653,6 +708,21 @@ function App() {
     }
   };
 
+  const handleTranscriptionModeChange = async (nextMode: "local" | "api") => {
+    if (nextMode === transcriptionMode) {
+      return;
+    }
+
+    if (!isMuted) {
+      await stopMic();
+    }
+
+    await saveTranscriptionBackendConfig({
+      mode: nextMode,
+      apiBaseUrl,
+    });
+  };
+
   const refreshAllModels = async () => {
     await scanForModels();
     await loadRemoteModels();
@@ -726,7 +796,10 @@ function App() {
   };
 
   const toggleMute = async () => {
-    console.log("toggleMute", isMuted);
+    if (isMicBusy) {
+      return;
+    }
+
     if (isMuted) {
       await startMic();
     } else {
@@ -734,10 +807,298 @@ function App() {
     }
   };
 
+  const apiHttpToWsUrl = (url: string) => {
+    if (url.startsWith("https://")) {
+      return `wss://${url.slice("https://".length)}`;
+    }
+    if (url.startsWith("http://")) {
+      return `ws://${url.slice("http://".length)}`;
+    }
+    return url;
+  };
+
+  const appendApiTranscript = (
+    text: string,
+    isFinal: boolean,
+    createdAt: string,
+    chunkIndex: number,
+  ) => {
+    const sessionId = apiSessionLocalIdRef.current;
+    if (sessionId === null || !text.trim()) {
+      return;
+    }
+
+    const segment: TranscriptionSegment = {
+      text,
+      timestamp: new Date(createdAt).getTime(),
+      sessionId,
+      messageId: chunkIndex,
+      isFinal,
+      source: "user",
+    };
+
+    setTranscriptions((prev) => {
+      const sessionKey = `${segment.source}-${segment.sessionId}`;
+      const sessions = [...prev];
+      const sessionIndex = sessions.findIndex(
+        (s) => s.sessionKey === sessionKey,
+      );
+
+      if (sessionIndex >= 0) {
+        const session = sessions[sessionIndex];
+        const nextMessages = [...session.messages];
+        const draftMessageId = apiDraftMessageIdRef.current;
+
+        if (!isFinal) {
+          if (draftMessageId !== null) {
+            const draftIndex = nextMessages.findIndex(
+              (message) => message.messageId === draftMessageId,
+            );
+            if (draftIndex >= 0) {
+              nextMessages[draftIndex] = {
+                ...nextMessages[draftIndex],
+                text: segment.text,
+                timestamp: segment.timestamp,
+                isFinal: false,
+              };
+              sessions[sessionIndex] = {
+                ...session,
+                messages: nextMessages,
+              };
+              return sessions;
+            }
+          }
+          nextMessages.push(segment);
+          apiDraftMessageIdRef.current = segment.messageId;
+        } else {
+          if (draftMessageId !== null) {
+            const draftIndex = nextMessages.findIndex(
+              (message) => message.messageId === draftMessageId,
+            );
+            if (draftIndex >= 0) {
+              nextMessages[draftIndex] = {
+                ...nextMessages[draftIndex],
+                text: segment.text,
+                timestamp: segment.timestamp,
+                isFinal: true,
+              };
+            } else {
+              const existingIndex = nextMessages.findIndex(
+                (message) => message.messageId === segment.messageId,
+              );
+              if (existingIndex >= 0) {
+                nextMessages[existingIndex] = segment;
+              } else {
+                nextMessages.push(segment);
+              }
+            }
+          } else {
+            const existingIndex = nextMessages.findIndex(
+              (message) => message.messageId === segment.messageId,
+            );
+            if (existingIndex >= 0) {
+              nextMessages[existingIndex] = segment;
+            } else {
+              nextMessages.push(segment);
+            }
+          }
+          apiDraftMessageIdRef.current = null;
+        }
+
+        nextMessages.sort((a, b) => a.messageId - b.messageId);
+        sessions[sessionIndex] = {
+          ...session,
+          messages: nextMessages,
+        };
+        return sessions;
+      }
+
+      return [
+        ...sessions,
+        {
+          sessionKey,
+          sessionId: segment.sessionId,
+          source: segment.source,
+          messages: [segment],
+          audioChunks: {},
+        },
+      ];
+    });
+
+    if (!isFinal) {
+      apiDraftMessageIdRef.current = segment.messageId;
+    } else {
+      apiDraftMessageIdRef.current = null;
+    }
+  };
+
+  const stopApiMic = async () => {
+    // Mute immediately on client side first.
+    setIsMuted(true);
+
+    const eventsSocket = apiEventsSocketRef.current;
+    if (eventsSocket) {
+      eventsSocket.close();
+      apiEventsSocketRef.current = null;
+    }
+
+    const stream = apiLocalStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      apiLocalStreamRef.current = null;
+    }
+
+    const peerConnection = apiPeerConnectionRef.current;
+    if (peerConnection) {
+      peerConnection.getSenders().forEach((sender) => sender.track?.stop());
+      peerConnection.close();
+      apiPeerConnectionRef.current = null;
+    }
+
+    const sessionId = apiSessionServerIdRef.current;
+    apiSessionServerIdRef.current = null;
+    apiSessionLocalIdRef.current = null;
+    apiDraftMessageIdRef.current = null;
+
+    if (sessionId) {
+      const baseUrl = apiBaseUrl.replace(/\/$/, "");
+      const closeController = new AbortController();
+      const closeTimeout = window.setTimeout(
+        () => closeController.abort(),
+        1500,
+      );
+      void fetch(`${baseUrl}/api/sessions/${sessionId}`, {
+        method: "DELETE",
+        signal: closeController.signal,
+      })
+        .catch((err) => {
+          console.error("Failed to close API session:", err);
+        })
+        .finally(() => {
+          window.clearTimeout(closeTimeout);
+        });
+    }
+  };
+
+  const startApiMic = async () => {
+    try {
+      const baseUrl = apiBaseUrl.replace(/\/$/, "");
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+      });
+      const peerConnection = new RTCPeerConnection();
+
+      for (const track of mediaStream.getAudioTracks()) {
+        peerConnection.addTrack(track, mediaStream);
+      }
+
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+
+      const localDescription = peerConnection.localDescription;
+      if (!localDescription) {
+        throw new Error("Failed to create local offer");
+      }
+
+      const offerController = new AbortController();
+      const offerTimeout = window.setTimeout(
+        () => offerController.abort(),
+        10000,
+      );
+      let response: Response;
+      try {
+        response = await fetch(`${baseUrl}/api/webrtc/offer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sdp: localDescription.sdp,
+            type: localDescription.type,
+          }),
+          signal: offerController.signal,
+        });
+      } finally {
+        window.clearTimeout(offerTimeout);
+      }
+
+      if (!response.ok) {
+        throw new Error(`Offer request failed: ${response.status}`);
+      }
+
+      const answer = (await response.json()) as {
+        session_id: string;
+        sdp: string;
+        type: RTCSdpType;
+      };
+
+      await peerConnection.setRemoteDescription(
+        new RTCSessionDescription({
+          sdp: answer.sdp,
+          type: answer.type,
+        }),
+      );
+
+      const ws = new WebSocket(
+        `${apiHttpToWsUrl(baseUrl)}/api/sessions/${answer.session_id}/events`,
+      );
+      ws.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data) as
+            | ApiTranscriptEvent
+            | { error: string };
+          if ("error" in payload) {
+            if (payload.error === "session_not_found") {
+              setError("APIセッションが見つかりません");
+            }
+            return;
+          }
+          appendApiTranscript(
+            payload.text,
+            payload.is_final,
+            payload.created_at,
+            payload.chunk_index,
+          );
+        } catch (err) {
+          console.error("Failed to parse transcript event:", err);
+        }
+      };
+      ws.onerror = () => {
+        setError("APIイベント接続エラー");
+      };
+
+      apiLocalStreamRef.current = mediaStream;
+      apiPeerConnectionRef.current = peerConnection;
+      apiEventsSocketRef.current = ws;
+      apiSessionServerIdRef.current = answer.session_id;
+      apiSessionLocalIdRef.current = Date.now();
+      apiDraftMessageIdRef.current = null;
+
+      setIsMuted(false);
+      setError("");
+    } catch (err) {
+      console.error("API mic start error:", err);
+      await stopApiMic();
+      setError(
+        `APIマイク開始エラー: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
   const startMic = async () => {
+    if (isMicBusy) {
+      return;
+    }
+
+    setIsMicBusy(true);
+
+    if (transcriptionMode === "api") {
+      await startApiMic();
+      setIsMicBusy(false);
+      return;
+    }
+
     if (!isInitialized) {
       setError("モデルを初期化中です...");
-      console.log("startMic", isInitialized);
+      setIsMicBusy(false);
       return;
     }
 
@@ -752,10 +1113,24 @@ function App() {
       setError(
         `マイク開始エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
+    } finally {
+      setIsMicBusy(false);
     }
   };
 
   const stopMic = async () => {
+    if (isMicBusy) {
+      return;
+    }
+
+    setIsMicBusy(true);
+
+    if (transcriptionMode === "api") {
+      await stopApiMic();
+      setIsMicBusy(false);
+      return;
+    }
+
     setIsMuted(true);
 
     try {
@@ -765,6 +1140,8 @@ function App() {
       setError(
         `録音停止エラー: ${err instanceof Error ? err.message : String(err)}`,
       );
+    } finally {
+      setIsMicBusy(false);
     }
   };
 
@@ -886,6 +1263,12 @@ function App() {
       if (copyAllFeedbackTimeoutRef.current) {
         window.clearTimeout(copyAllFeedbackTimeoutRef.current);
       }
+      apiEventsSocketRef.current?.close();
+      apiEventsSocketRef.current = null;
+      apiLocalStreamRef.current?.getTracks().forEach((track) => track.stop());
+      apiLocalStreamRef.current = null;
+      apiPeerConnectionRef.current?.close();
+      apiPeerConnectionRef.current = null;
     };
   }, []);
 
@@ -1034,6 +1417,30 @@ function App() {
           </button>
         </div>
 
+        <div className="shrink-0 flex items-center gap-2">
+          <span className="text-xs opacity-70">モード</span>
+          <div className="join">
+            <button
+              className={`join-item btn btn-xs ${
+                transcriptionMode === "local" ? "btn-primary" : "btn-ghost"
+              }`}
+              onClick={() => void handleTranscriptionModeChange("local")}
+              title="ローカルモード"
+            >
+              Local
+            </button>
+            <button
+              className={`join-item btn btn-xs ${
+                transcriptionMode === "api" ? "btn-primary" : "btn-ghost"
+              }`}
+              onClick={() => void handleTranscriptionModeChange("api")}
+              title="APIモード"
+            >
+              API
+            </button>
+          </div>
+        </div>
+
         <div className="flex-1"></div>
 
         <div className="flex items-center gap-2 shrink-0">
@@ -1056,17 +1463,23 @@ function App() {
           <div className="join">
             <button
               className={`join-item btn btn-sm ${
-                !isInitialized
+                transcriptionMode === "local" && !isInitialized
                   ? "btn-disabled"
                   : isMuted
                     ? "btn-ghost"
                     : "btn-primary"
               }`}
               onClick={toggleMute}
-              disabled={!isInitialized}
-              title={isMuted ? "マイクON" : "マイクOFF"}
+              disabled={
+                isMicBusy || (transcriptionMode === "local" && !isInitialized)
+              }
+              title={
+                isMicBusy ? "接続中..." : isMuted ? "マイクON" : "マイクOFF"
+              }
             >
-              {isMuted ? (
+              {isMicBusy ? (
+                <span className="loading loading-spinner loading-xs"></span>
+              ) : isMuted ? (
                 <MicOff className="w-4 h-4" />
               ) : (
                 <Mic className="w-4 h-4" />
@@ -1141,28 +1554,24 @@ function App() {
                     key={session.sessionKey}
                     className={`chat ${alignment} mb-4 space-y-2`}
                   >
-                    <div className={`chat-bubble text-sm ${bubbleColor}`}>
-                      <div className="space-y-2">
-                        {session.messages.map((message) => {
-                          const messageKey = `${session.sessionKey}-${message.messageId}`;
-                          return (
-                            <span
-                              key={messageKey}
-                              className={` ${
-                                message.isFinal ? "" : "opacity-70"
-                              }`}
-                            >
-                              <span className="flex-1 text-left">
-                                {message.text}
-                                {!message.isFinal && (
-                                  <span className="loading loading-dots loading-xs ml-1 align-bottom"></span>
-                                )}
-                              </span>
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </div>
+                    {session.messages.map((message) => {
+                      const messageKey = `${session.sessionKey}-${message.messageId}`;
+                      return (
+                        <div
+                          key={messageKey}
+                          className={`chat-bubble text-sm ${bubbleColor} ${
+                            message.isFinal ? "" : "opacity-70"
+                          }`}
+                        >
+                          <span className="flex-1 text-left">
+                            {message.text}
+                            {!message.isFinal && (
+                              <span className="loading loading-dots loading-xs ml-1 align-bottom"></span>
+                            )}
+                          </span>
+                        </div>
+                      );
+                    })}
                     <div className="chat-footer opacity-50 flex justify-between items-center mt-1">
                       <button
                         onClick={() =>
@@ -1375,22 +1784,50 @@ function App() {
                   マイク設定
                 </summary>
                 <div className="collapse-content">
-                  <div className="form-control">
-                    <label className="label">
-                      <span className="label-text">入力デバイス</span>
-                    </label>
-                    <select
-                      value={selectedAudioDevice}
-                      onChange={(e) => handleAudioDeviceChange(e.target.value)}
-                      className="select select-bordered w-full"
-                    >
-                      {audioDevices.map((device) => (
-                        <option key={device.name} value={device.name}>
-                          {device.name}
-                          {device.is_default ? " (デフォルト)" : ""}
-                        </option>
-                      ))}
-                    </select>
+                  <div className="space-y-4">
+                    <div className="form-control">
+                      <label className="label">
+                        <span className="label-text">APIサーバーURL</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={apiBaseUrl}
+                        onChange={(e) => setApiBaseUrl(e.target.value)}
+                        onBlur={() =>
+                          saveTranscriptionBackendConfig({
+                            mode: transcriptionMode,
+                            apiBaseUrl,
+                          })
+                        }
+                        className="input input-bordered w-full"
+                        placeholder="http://127.0.0.1:8000"
+                      />
+                      <label className="label">
+                        <span className="label-text-alt opacity-70">
+                          APIモード時に /api/webrtc/offer へ接続します
+                        </span>
+                      </label>
+                    </div>
+
+                    <div className="form-control">
+                      <label className="label">
+                        <span className="label-text">入力デバイス</span>
+                      </label>
+                      <select
+                        value={selectedAudioDevice}
+                        onChange={(e) =>
+                          handleAudioDeviceChange(e.target.value)
+                        }
+                        className="select select-bordered w-full"
+                      >
+                        {audioDevices.map((device) => (
+                          <option key={device.name} value={device.name}>
+                            {device.name}
+                            {device.is_default ? " (デフォルト)" : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
                 </div>
               </details>

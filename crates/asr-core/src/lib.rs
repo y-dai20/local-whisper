@@ -46,7 +46,7 @@ pub struct WhisperParams {
 impl Default for WhisperParams {
     fn default() -> Self {
         Self {
-            audio_ctx: 512,
+            audio_ctx: 1500,
             temperature: 0.0,
         }
     }

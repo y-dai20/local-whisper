@@ -168,6 +168,13 @@ pub struct AudioDevice {
     pub is_default: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TranscriptionBackendConfig {
+    pub mode: String,
+    #[serde(rename = "apiBaseUrl")]
+    pub api_base_url: String,
+}
+
 
 
 pub(crate) async fn start_recording_impl(language: Option<String>) -> Result<(), String> {
@@ -341,6 +348,42 @@ pub(crate) async fn get_streaming_config_impl() -> Result<StreamingConfig, Strin
         partial_interval_seconds: state_guard.partial_transcript_interval_samples as f32
             / VAD_SAMPLE_RATE as f32,
     })
+}
+
+pub(crate) async fn get_transcription_backend_config_impl(
+) -> Result<TranscriptionBackendConfig, String> {
+    let state = recording_state();
+    let state_guard = state.lock();
+    Ok(TranscriptionBackendConfig {
+        mode: state_guard.transcription_mode.clone(),
+        api_base_url: state_guard.api_base_url.clone(),
+    })
+}
+
+pub(crate) async fn set_transcription_backend_config_impl(
+    config: TranscriptionBackendConfig,
+) -> Result<(), String> {
+    let mode = config.mode.trim().to_lowercase();
+    if mode != "local" && mode != "api" {
+        return Err("mode must be either 'local' or 'api'".to_string());
+    }
+
+    let url = config.api_base_url.trim().to_string();
+    if url.is_empty() {
+        return Err("apiBaseUrl cannot be empty".to_string());
+    }
+
+    let state = recording_state();
+    let mut state_guard = state.lock();
+    state_guard.transcription_mode = mode.clone();
+    state_guard.api_base_url = url.clone();
+
+    info!(
+        "Updated transcription backend config: mode={}, api_base_url={}",
+        mode, url
+    );
+
+    Ok(())
 }
 
 pub(crate) async fn set_streaming_config_impl(config: StreamingConfig) -> Result<(), String> {
