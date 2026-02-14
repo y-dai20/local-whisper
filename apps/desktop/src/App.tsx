@@ -1632,126 +1632,129 @@ function App() {
               summaryPanelText ? (isSummaryExpanded ? "pt-32" : "pt-16") : ""
             }`}
           >
-          {error && (
-            <div className="alert alert-error">
-              <span className="text-sm">{error}</span>
-            </div>
-          )}
+            {error && (
+              <div className="alert alert-error">
+                <span className="text-sm">{error}</span>
+              </div>
+            )}
 
-          {transcriptions.length === 0 &&
-          !voiceActivity.user.isActive &&
-          !voiceActivity.system.isActive ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center text-base-content/30 min-h-[50vh]">
-              <MessageSquare className="w-16 h-16 mb-4 opacity-20" />
-              <p className="text-sm font-medium">
-                マイクをオンにして、あなたの声を文字起こしします。
-              </p>
-              <p className="text-sm font-medium">
-                録音/録画をオンにして、システム音声を文字起こしします。
-              </p>
-            </div>
-          ) : (
-            <div className="flex flex-col pb-4">
-              {transcriptions.map((session) => {
-                const alignment =
-                  session.source === "user" ? "chat-end" : "chat-start";
-                const bubbleColor =
-                  session.source === "user"
-                    ? "chat-bubble-primary"
-                    : "chat-bubble-secondary";
-                const sessionText = session.messages
-                  .map((message) => message.text)
-                  .join("\n");
-                const sessionAudio = session.messages
-                  .map(
-                    (message) => session.audioChunks[message.messageId] || [],
-                  )
-                  .flat();
-                return (
-                  <div
-                    key={session.sessionKey}
-                    className={`chat ${alignment} mb-4 space-y-2`}
-                  >
-                    {session.messages.map((message) => {
-                      const messageKey = `${session.sessionKey}-${message.messageId}`;
-                      return (
-                        <div
-                          key={messageKey}
-                          className={`chat-bubble text-sm ${bubbleColor} ${
-                            message.isFinal ? "" : "opacity-70"
-                          }`}
-                        >
-                          <span className="flex-1 text-left">
-                            {message.text}
-                            {!message.isFinal && (
-                              <span className="loading loading-dots loading-xs ml-1 align-bottom"></span>
-                            )}
-                          </span>
-                        </div>
-                      );
-                    })}
-                    <div className="chat-footer opacity-50 flex justify-between items-center mt-1">
-                      <button
-                        onClick={() =>
-                          handleCopySessionText(session.sessionKey, sessionText)
-                        }
-                        className="btn btn-ghost btn-xs btn-circle"
-                        title={
-                          copiedSessionKey === session.sessionKey
-                            ? "コピー完了"
-                            : "コピー"
-                        }
-                      >
-                        {copiedSessionKey === session.sessionKey ? (
-                          <Check className="w-3 h-3" />
-                        ) : (
-                          <Copy className="w-3 h-3" />
-                        )}
-                      </button>
-                      {sessionAudio.length > 0 && (
+            {transcriptions.length === 0 &&
+            !voiceActivity.user.isActive &&
+            !voiceActivity.system.isActive ? (
+              <div className="flex-1 flex flex-col items-center justify-center text-center text-base-content/30 min-h-[50vh]">
+                <MessageSquare className="w-16 h-16 mb-4 opacity-20" />
+                <p className="text-sm font-medium">
+                  マイクをオンにして、あなたの声を文字起こしします。
+                </p>
+                <p className="text-sm font-medium">
+                  録音/録画をオンにして、システム音声を文字起こしします。
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col">
+                {transcriptions.map((session) => {
+                  const alignment =
+                    session.source === "user" ? "chat-end" : "chat-start";
+                  const bubbleColor =
+                    session.source === "user"
+                      ? "chat-bubble-primary"
+                      : "chat-bubble-secondary";
+                  const sessionText = session.messages
+                    .map((message) => message.text)
+                    .join("\n");
+                  const sessionAudio = session.messages
+                    .map(
+                      (message) => session.audioChunks[message.messageId] || [],
+                    )
+                    .flat();
+                  return (
+                    <div
+                      key={session.sessionKey}
+                      className={`chat ${alignment}`}
+                    >
+                      {session.messages.map((message, idx) => {
+                        const messageKey = `${session.sessionKey}-${message.messageId}`;
+                        return (
+                          <div
+                            key={messageKey}
+                            className={`chat-bubble text-sm ${bubbleColor} ${
+                              message.isFinal ? "" : "opacity-70"
+                            } ${idx > 0 ? "mt-2" : ""}`}
+                          >
+                            <span className="flex-1 text-left">
+                              {message.text}
+                              {!message.isFinal && (
+                                <span className="loading loading-dots loading-xs ml-1 align-bottom"></span>
+                              )}
+                            </span>
+                          </div>
+                        );
+                      })}
+                      <div className="chat-footer opacity-50 flex justify-between items-center">
                         <button
                           onClick={() =>
-                            playSessionAudio(sessionAudio, session.sessionKey)
+                            handleCopySessionText(
+                              session.sessionKey,
+                              sessionText,
+                            )
                           }
                           className="btn btn-ghost btn-xs btn-circle"
+                          title={
+                            copiedSessionKey === session.sessionKey
+                              ? "コピー完了"
+                              : "コピー"
+                          }
                         >
-                          {playingSessionKey === session.sessionKey ? (
-                            <Square className="w-3 h-3" />
+                          {copiedSessionKey === session.sessionKey ? (
+                            <Check className="w-3 h-3" />
                           ) : (
-                            <Play className="w-3 h-3" />
+                            <Copy className="w-3 h-3" />
                           )}
                         </button>
-                      )}
+                        {sessionAudio.length > 0 && (
+                          <button
+                            onClick={() =>
+                              playSessionAudio(sessionAudio, session.sessionKey)
+                            }
+                            className="btn btn-ghost btn-xs btn-circle"
+                          >
+                            {playingSessionKey === session.sessionKey ? (
+                              <Square className="w-3 h-3" />
+                            ) : (
+                              <Play className="w-3 h-3" />
+                            )}
+                          </button>
+                        )}
 
-                      <time className="text-[10px] opacity-60">
-                        {new Date(
-                          session.messages[0].timestamp,
-                        ).toLocaleTimeString([], {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </time>
+                        <time className="text-[10px] opacity-60">
+                          {new Date(
+                            session.messages[0].timestamp,
+                          ).toLocaleTimeString([], {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </time>
+                      </div>
+                    </div>
+                  );
+                })}
+                {showUserActivityIndicator && (
+                  <div className="chat chat-end">
+                    <div className="chat-bubble chat-bubble-primary opacity-70 text-sm">
+                      <span className="loading loading-dots loading-xs"></span>
                     </div>
                   </div>
-                );
-              })}
-              {showUserActivityIndicator && (
-                <div className="chat chat-end">
-                  <div className="chat-bubble chat-bubble-primary opacity-70 text-sm">
-                    <span className="loading loading-dots loading-xs"></span>
+                )}
+                {showSystemActivityIndicator && (
+                  <div className="chat chat-start">
+                    <div className="chat-bubble chat-bubble-secondary opacity-70 text-sm">
+                      <span className="loading loading-dots loading-xs"></span>
+                    </div>
                   </div>
-                </div>
-              )}
-              {showSystemActivityIndicator && (
-                <div className="chat chat-start">
-                  <div className="chat-bubble chat-bubble-secondary opacity-70 text-sm">
-                    <span className="loading loading-dots loading-xs"></span>
-                  </div>
-                </div>
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-          )}
+                )}
+                <div ref={messagesEndRef} />
+              </div>
+            )}
           </div>
         </div>
       </main>
