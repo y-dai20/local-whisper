@@ -6,7 +6,6 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::Mutex;
-use serde::Deserialize;
 use tauri::AppHandle;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -14,12 +13,16 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::TranscriptionSource;
+use crate::audio::processing::save_audio_session_to_wav;
+use crate::audio::state::try_recording_state;
 use crate::emit_transcription_segment;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct WebSocketTranscriptEvent {
     pub session_id: Option<String>,
     pub chunk_index: Option<u64>,
+    pub start_seconds: Option<f64>,
+    pub end_seconds: Option<f64>,
     pub text: Option<String>,
     pub is_final: Option<bool>,
 }
@@ -28,6 +31,9 @@ struct SourceConnection {
     outbound_tx: tokio_mpsc::UnboundedSender<Message>,
     transcript_rx: Receiver<WebSocketTranscriptEvent>,
     unhealthy: Arc<AtomicBool>,
+    buffered_audio: Vec<f32>,
+    buffered_start_sample: u64,
+    total_input_samples: u64,
 }
 
 struct WebSocketTranscriptionClient {
@@ -39,6 +45,7 @@ static CLIENT: OnceCell<Mutex<WebSocketTranscriptionClient>> = OnceCell::new();
 static REMOTE_SESSION_ID_MAP: Lazy<Mutex<HashMap<String, u64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static NEXT_REMOTE_SESSION_ID: Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(2_000_000));
+const SAMPLE_RATE: u64 = 16_000;
 
 pub fn stream_audio_chunk_and_emit(
     audio_16k_f32: &[f32],
@@ -50,23 +57,31 @@ pub fn stream_audio_chunk_and_emit(
 ) -> Result<(), String> {
     let events = send_audio_to_websocket(audio_16k_f32, source, is_final)?;
 
-    for event in events {
+    for (event, event_audio) in events {
         let Some(text) = event.text.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()) else {
             continue;
         };
+
         let message_id = event.chunk_index.unwrap_or(0);
         let event_is_final = event.is_final.unwrap_or(is_final);
-        let mapped_session_id = resolve_remote_session_id(event.session_id.as_deref(), session_id_counter);
+        let mapped_session_id =
+            resolve_remote_session_id(event.session_id.as_deref(), session_id_counter);
 
         emit_transcription_segment(
             app_handle,
             text.to_string(),
-            None,
+            event_audio.clone(),
             mapped_session_id,
             message_id,
             event_is_final,
             source.event_source().to_string(),
         )?;
+
+        if event_is_final {
+            if let Some(audio) = event_audio.as_deref() {
+                persist_api_audio_if_needed(audio, mapped_session_id, message_id, source);
+            }
+        }
     }
 
     Ok(())
@@ -88,7 +103,7 @@ fn send_audio_to_websocket(
     audio_16k_f32: &[f32],
     source: TranscriptionSource,
     is_final: bool,
-) -> Result<Vec<WebSocketTranscriptEvent>, String> {
+) -> Result<Vec<(WebSocketTranscriptEvent, Option<Vec<f32>>)>, String> {
     if audio_16k_f32.is_empty() {
         return Ok(Vec::new());
     }
@@ -122,6 +137,7 @@ fn send_audio_to_websocket(
         .connections
         .get_mut(&source)
         .ok_or_else(|| "WebSocket connection not found".to_string())?;
+
     if conn.unhealthy.load(Ordering::Relaxed) {
         log::warn!(
             "WebSocket({}): connection unhealthy, dropping and requiring reconnect",
@@ -135,11 +151,17 @@ fn send_audio_to_websocket(
     conn.outbound_tx
         .send(Message::Binary(i16_to_le_bytes(&pcm).into()))
         .map_err(|e| format!("Failed to queue WS PCM binary: {}", e))?;
+
     if is_final {
         conn.outbound_tx
             .send(Message::Text("flush".to_string().into()))
             .map_err(|e| format!("Failed to queue WS flush command: {}", e))?;
     }
+
+    conn.buffered_audio.extend_from_slice(audio_16k_f32);
+    conn.total_input_samples = conn
+        .total_input_samples
+        .wrapping_add(audio_16k_f32.len() as u64);
 
     drain_events(conn)
 }
@@ -186,21 +208,11 @@ async fn create_connection(source: TranscriptionSource) -> Result<SourceConnecti
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    handle_text_message(
-                        &text,
-                        &tx,
-                        &session_id_read,
-                        &source_name_read,
-                    );
+                    handle_text_message(&text, &tx, &session_id_read, &source_name_read);
                 }
                 Ok(Message::Binary(bin)) => {
                     if let Ok(text) = String::from_utf8(bin.to_vec()) {
-                        handle_text_message(
-                            &text,
-                            &tx,
-                            &session_id_read,
-                            &source_name_read,
-                        );
+                        handle_text_message(&text, &tx, &session_id_read, &source_name_read);
                     }
                 }
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
@@ -223,6 +235,9 @@ async fn create_connection(source: TranscriptionSource) -> Result<SourceConnecti
         outbound_tx,
         transcript_rx: rx,
         unhealthy,
+        buffered_audio: Vec::new(),
+        buffered_start_sample: 0,
+        total_input_samples: 0,
     })
 }
 
@@ -285,11 +300,20 @@ fn websocket_url() -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
-fn drain_events(conn: &mut SourceConnection) -> Result<Vec<WebSocketTranscriptEvent>, String> {
+fn drain_events(
+    conn: &mut SourceConnection,
+) -> Result<Vec<(WebSocketTranscriptEvent, Option<Vec<f32>>)>, String> {
     let mut events = Vec::new();
     loop {
         match conn.transcript_rx.try_recv() {
-            Ok(event) => events.push(event),
+            Ok(event) => {
+                let event_audio = if event.is_final.unwrap_or(false) {
+                    extract_audio_from_time_range(conn, event.start_seconds, event.end_seconds)
+                } else {
+                    None
+                };
+                events.push((event, event_audio));
+            }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 return Err("WebSocket transcript channel disconnected".to_string());
@@ -319,12 +343,85 @@ fn transcript_event_from_value(
             .get("chunk_index")
             .or_else(|| value.get("chunkIndex"))
             .and_then(|v| v.as_u64()),
+        start_seconds: value
+            .get("start_time_sec")
+            .and_then(json_number_to_f64),
+        end_seconds: value
+            .get("end_time_sec")
+            .and_then(json_number_to_f64),
         text: Some(text),
         is_final: value
             .get("is_final")
             .or_else(|| value.get("isFinal"))
             .and_then(|v| v.as_bool()),
     })
+}
+
+fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|v| v as f64))
+        .or_else(|| value.as_u64().map(|v| v as f64))
+}
+
+fn extract_audio_from_time_range(
+    conn: &mut SourceConnection,
+    start_seconds: Option<f64>,
+    end_seconds: Option<f64>,
+) -> Option<Vec<f32>> {
+    let (start_seconds, end_seconds) = match (start_seconds, end_seconds) {
+        (Some(start), Some(end)) if end > start && start >= 0.0 => (start, end),
+        _ => return None,
+    };
+
+    let start_sample = (start_seconds * SAMPLE_RATE as f64).floor() as u64;
+    let end_sample = (end_seconds * SAMPLE_RATE as f64).ceil() as u64;
+    if end_sample <= start_sample {
+        return None;
+    }
+
+    let buffer_end_sample = conn
+        .buffered_start_sample
+        .wrapping_add(conn.buffered_audio.len() as u64);
+
+    if start_sample < conn.buffered_start_sample || end_sample > buffer_end_sample {
+        log::warn!(
+            "WebSocket: requested sample range [{}..{}) is outside buffered range [{}..{})",
+            start_sample,
+            end_sample,
+            conn.buffered_start_sample,
+            buffer_end_sample
+        );
+        return None;
+    }
+
+    let from = (start_sample - conn.buffered_start_sample) as usize;
+    let to = (end_sample - conn.buffered_start_sample) as usize;
+    if to <= from {
+        return None;
+    }
+
+    let extracted = conn.buffered_audio[from..to].to_vec();
+    prune_buffer_before_sample(conn, end_sample);
+    Some(extracted)
+}
+
+fn prune_buffer_before_sample(conn: &mut SourceConnection, sample: u64) {
+    if sample <= conn.buffered_start_sample {
+        return;
+    }
+
+    let buffer_end_sample = conn
+        .buffered_start_sample
+        .wrapping_add(conn.buffered_audio.len() as u64);
+    let prune_to = sample.min(buffer_end_sample);
+    if prune_to <= conn.buffered_start_sample {
+        return;
+    }
+
+    let drop_count = (prune_to - conn.buffered_start_sample) as usize;
+    conn.buffered_audio.drain(0..drop_count);
+    conn.buffered_start_sample = prune_to;
 }
 
 fn f32_to_i16(audio: &[f32]) -> Vec<i16> {
@@ -362,4 +459,46 @@ fn resolve_remote_session_id(remote_id: Option<&str>, fallback: u64) -> u64 {
     let assigned = *next;
     map.insert(remote.to_string(), assigned);
     assigned
+}
+
+fn persist_api_audio_if_needed(
+    audio_16k_f32: &[f32],
+    mapped_session_id: u64,
+    message_id: u64,
+    source: TranscriptionSource,
+) {
+    let Some(state) = try_recording_state() else {
+        return;
+    };
+    let guard = state.lock();
+    if !guard.recording_save_enabled || !guard.is_recording {
+        return;
+    }
+    let Some(recording_dir) = guard.current_recording_dir.clone() else {
+        return;
+    };
+    drop(guard);
+
+    let source_tag = match source {
+        TranscriptionSource::Mic => "mic",
+        TranscriptionSource::System => "system",
+    };
+    let synthetic_session_id = mapped_session_id
+        .wrapping_mul(1_000_000)
+        .wrapping_add(message_id);
+    let audio = audio_16k_f32.to_vec();
+
+    std::thread::spawn(move || {
+        if let Err(err) =
+            save_audio_session_to_wav(&audio, synthetic_session_id, &recording_dir, source_tag)
+        {
+            log::error!(
+                "Failed to save API {} audio for session={}, message={}: {}",
+                source_tag,
+                mapped_session_id,
+                message_id,
+                err
+            );
+        }
+    });
 }
