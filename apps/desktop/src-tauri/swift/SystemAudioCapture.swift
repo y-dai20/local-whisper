@@ -131,11 +131,32 @@ class SystemAudioCapture: NSObject, SCStreamDelegate, SCStreamOutput {
 private var captureInstance: SystemAudioCapture?
 private var lastSystemAudioError: NSString = ""
 
+private final class LockedInt32: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int32
+
+    init(_ value: Int32) {
+        self.value = value
+    }
+
+    func set(_ newValue: Int32) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func get() -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 @_cdecl("system_audio_start")
 public func systemAudioStart(callback: @escaping @convention(c) (UnsafePointer<Float>, Int) -> Void) -> Int32 {
     if #available(macOS 13.0, *) {
         let semaphore = DispatchSemaphore(value: 0)
-        var startResult: Int32 = -1
+        let startResult = LockedInt32(-1)
 
         Task.detached {
             do {
@@ -143,17 +164,17 @@ public func systemAudioStart(callback: @escaping @convention(c) (UnsafePointer<F
                 try await capture.startCapture(callback: callback)
                 captureInstance = capture
                 lastSystemAudioError = ""
-                startResult = 0
+                startResult.set(0)
             } catch {
                 let nsError = error as NSError
                 lastSystemAudioError = error.localizedDescription as NSString
-                startResult = Int32(nsError.code)
+                startResult.set(Int32(nsError.code))
             }
             semaphore.signal()
         }
 
         semaphore.wait()
-        return startResult
+        return startResult.get()
     } else {
         lastSystemAudioError = "System audio capture requires macOS 13.0+" as NSString
         return -2
