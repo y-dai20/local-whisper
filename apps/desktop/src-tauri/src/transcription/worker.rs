@@ -179,12 +179,11 @@ pub fn spawn_transcription_worker(
                         }
                     }
 
-                    for (audio, language, source, session_id_counter) in final_requests {
+                    for (audio, language, source, _session_id_counter) in final_requests {
                         if let Err(err) = transcribe_and_emit(
                             &audio,
                             language.clone(),
                             source,
-                            session_id_counter,
                             true,
                             &app_handle,
                         ) {
@@ -196,12 +195,11 @@ pub fn spawn_transcription_worker(
                         if sessions_with_final.contains(&key) {
                             continue;
                         }
-                        let (source, session_id_counter) = key;
+                        let (source, _session_id_counter) = key;
                         if let Err(err) = transcribe_and_emit(
                             &audio,
                             language.clone(),
                             source,
-                            session_id_counter,
                             is_final,
                             &app_handle,
                         ) {
@@ -343,7 +341,6 @@ fn transcribe_and_emit(
     audio_data: &[f32],
     language: Option<String>,
     source: TranscriptionSource,
-    session_id_counter: u64,
     is_final: bool,
     app_handle: &AppHandle,
 ) -> Result<(), String> {
