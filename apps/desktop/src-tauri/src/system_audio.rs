@@ -2,7 +2,7 @@ use crate::audio::{
     try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES, VAD_CHUNK_SIZE,
     VAD_POST_BUFFER_SAMPLES, VAD_PRE_BUFFER_SAMPLES, VAD_SAMPLE_RATE,
 };
-use crate::transcription::webrtc_client::stream_audio_chunk_and_emit;
+use crate::transcription::api_client::stream_audio_chunk_and_emit;
 use crate::transcription::worker::queue_transcription_with_source;
 use crate::transcription::{spawn_transcription_worker, TranscriptionSource};
 use log::{error, info};
@@ -108,6 +108,14 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
         }
 
         if api_stream_mode {
+            if !session.session_audio.is_empty() {
+                finalize_system_audio_session(
+                    session,
+                    "api_connected_switch",
+                    app_handle,
+                    language.as_deref(),
+                );
+            }
             if let Some(app) = app_handle {
                 let now = std::time::Instant::now();
                 if now.duration_since(session.last_vad_event_time).as_millis() >= 500 {

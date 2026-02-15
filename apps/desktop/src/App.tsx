@@ -212,12 +212,8 @@ function App() {
             messages: upsertMessages(session.messages),
             audioChunks: upsertAudioChunks(session.audioChunks),
           };
-          return sessions;
-        }
-
-        return [
-          ...sessions,
-          {
+        } else {
+          sessions.push({
             sessionKey,
             sessionId: segment.sessionId,
             source: segment.source,
@@ -225,12 +221,55 @@ function App() {
             audioChunks: segment.audioData?.length
               ? { [segment.messageId]: segment.audioData }
               : {},
-          },
-        ];
+          });
+        }
+
+        // Keep only the currently arriving segment in-progress.
+        return sessions.map((session) => {
+          if (session.source !== segment.source) {
+            return session;
+          }
+
+          let changed = false;
+          const nextMessages = session.messages.map((message) => {
+            const isCurrentIncoming =
+              session.sessionKey === sessionKey &&
+              message.messageId === segment.messageId;
+            if (!isCurrentIncoming && !message.isFinal) {
+              changed = true;
+              return { ...message, isFinal: true };
+            }
+            return message;
+          });
+
+          if (!changed) {
+            return session;
+          }
+          return {
+            ...session,
+            messages: nextMessages,
+          };
+        });
       });
     },
     [],
   );
+
+  const finalizeAllInProgressMessages = useCallback(() => {
+    setTranscriptions((prev) =>
+      prev.map((session) => {
+        let changed = false;
+        const messages = session.messages.map((message) => {
+          if (message.isFinal) {
+            return message;
+          }
+          changed = true;
+          return { ...message, isFinal: true };
+        });
+        return changed ? { ...session, messages } : session;
+      }),
+    );
+  }, []);
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
@@ -332,13 +371,10 @@ function App() {
   const saveTranscriptionBackendConfig = useCallback(
     async (config: TranscriptionBackendConfig) => {
       try {
-        const normalizedConfig: TranscriptionBackendConfig = {
-          mode: config.mode,
-        };
         await invoke("set_transcription_backend_config", {
-          config: normalizedConfig,
+          config,
         });
-        setTranscriptionMode(normalizedConfig.mode);
+        setTranscriptionMode(config.mode);
       } catch (err) {
         console.error("Failed to save transcription backend config:", err);
         setError(
@@ -615,6 +651,7 @@ function App() {
           setError(payload.message);
         }
         if (payload.fallbackMode === "local") {
+          finalizeAllInProgressMessages();
           setTranscriptionMode("local");
         }
       },
@@ -636,7 +673,13 @@ function App() {
       unlistenVoiceActivity.then((fn) => fn());
       unlistenBackendError.then((fn) => fn());
     };
-  }, [loadStreamingConfig, loadWhisperParams, loadTranscriptionBackendConfig, upsertTranscriptionSegment]);
+  }, [
+    finalizeAllInProgressMessages,
+    loadStreamingConfig,
+    loadWhisperParams,
+    loadTranscriptionBackendConfig,
+    upsertTranscriptionSegment,
+  ]);
 
   const getTotalMessageCount = useCallback(
     (sessions: SessionTranscription[]) =>
@@ -793,6 +836,7 @@ function App() {
       return;
     }
 
+    finalizeAllInProgressMessages();
     await saveTranscriptionBackendConfig({
       mode: nextMode,
     });

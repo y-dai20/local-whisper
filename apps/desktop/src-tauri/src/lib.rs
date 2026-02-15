@@ -380,17 +380,23 @@ pub(crate) async fn set_transcription_backend_config_impl(
     let state = recording_state();
     let mut state_guard = state.lock();
     let previous_mode = state_guard.transcription_mode.clone();
+    let switched_local_to_api = previous_mode == "local" && mode == "api";
 
-    if previous_mode == "local" && mode == "api" {
+    if switched_local_to_api {
         if !state_guard.is_muted {
             finalize_active_session(&mut state_guard, "mode_switch_local_to_api");
         }
-        drop(state_guard);
+    }
+
+    state_guard.transcription_mode = mode.clone();
+    drop(state_guard);
+
+    if switched_local_to_api {
         system_audio::finalize_active_system_audio_session("mode_switch_local_to_api");
-        let mut state_guard = state.lock();
-        state_guard.transcription_mode = mode.clone();
-    } else {
-        state_guard.transcription_mode = mode.clone();
+    }
+
+    if previous_mode != mode {
+        transcription::api_client::reset_all_connections();
     }
 
     info!("Updated transcription backend config: mode={}", mode);

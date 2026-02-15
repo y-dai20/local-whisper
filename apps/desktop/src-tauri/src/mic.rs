@@ -10,7 +10,7 @@ use crate::audio::processing::finalize_active_session;
 use crate::audio::state::{recording_state, SileroVadState};
 use crate::audio::utils::resample_audio;
 use crate::emit_voice_activity_event;
-use crate::transcription::webrtc_client::stream_audio_chunk_and_emit;
+use crate::transcription::api_client::stream_audio_chunk_and_emit;
 use crate::transcription::{spawn_transcription_worker, TranscriptionSource};
 use crate::transcription::worker::stop_transcription_worker;
 
@@ -144,6 +144,9 @@ pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -
                         };
 
                         if state.transcription_mode == "api" {
+                            if !state.session_audio.is_empty() {
+                                finalize_active_session(&mut state, "api_connected_switch");
+                            }
                             if !state.suppress_transcription {
                                 let language = state
                                     .language
@@ -152,7 +155,11 @@ pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -
                                 let session_id_counter = state
                                     .transcription_state(TranscriptionSource::Mic)
                                     .session_id_counter;
-                                api_payload = Some((processed_samples, language, session_id_counter));
+                                api_payload = Some((
+                                    processed_samples,
+                                    language,
+                                    session_id_counter,
+                                ));
                             }
 
                             let now = std::time::Instant::now();
@@ -173,9 +180,7 @@ pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -
                             }
                         }
 
-                        if state.transcription_mode != "api"
-                            && state.session_samples >= state.session_max_samples
-                        {
+                        if state.session_samples >= state.session_max_samples {
                             finalize_active_session(&mut state, "session_max_duration");
                         }
                         let mut count = callback_count.lock();

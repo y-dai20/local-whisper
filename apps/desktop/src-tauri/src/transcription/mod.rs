@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod worker;
-pub mod webrtc_client;
+pub mod websocket_client;
+pub mod api_client;
 
 pub use worker::spawn_transcription_worker;
 
