@@ -79,8 +79,6 @@ type VoiceActivitySourceState = {
 
 type VoiceActivityState = Record<"user" | "system", VoiceActivitySourceState>;
 
-type VoiceSource = "user" | "system";
-
 interface WhisperParamsConfig {
   audioCtx: number;
   temperature: number;
@@ -621,7 +619,12 @@ function App() {
       (event) => {
         const segment = event.payload;
 
-        console.log("[App] Received transcription segment:", segment);
+        console.log(
+          "[App] Received transcription segment:",
+          segment,
+          "audioDataLen=",
+          segment.audioData?.length ?? 0,
+        );
         upsertTranscriptionSegment(segment);
       },
     );
@@ -1246,32 +1249,22 @@ function App() {
     }
   };
 
-  const isPendingVoiceSession = (source: VoiceSource) => {
-    const state = voiceActivity[source];
-    if (!state.isActive || state.sessionId === null) {
-      return false;
-    }
-    if (
-      !transcriptions.some(
-        (session) =>
-          session.source === source && session.sessionId === state.sessionId,
-      )
-    ) {
-      return false;
-    }
-    return true;
-  };
-
-  const pendingUserSessionKey = isPendingVoiceSession("user");
-  const pendingSystemSessionKey = isPendingVoiceSession("system");
   const showUserActivityIndicator =
     transcriptionMode !== "api" &&
     voiceActivity.user.isActive &&
-    !pendingUserSessionKey;
+    !transcriptions.some(
+      (session) =>
+        session.source === "user" &&
+        session.messages.some((message) => !message.isFinal),
+    );
   const showSystemActivityIndicator =
     transcriptionMode !== "api" &&
     voiceActivity.system.isActive &&
-    !pendingSystemSessionKey;
+    !transcriptions.some(
+      (session) =>
+        session.source === "system" &&
+        session.messages.some((message) => !message.isFinal),
+    );
 
   return (
     <div className="flex flex-col h-screen w-screen bg-base-100">

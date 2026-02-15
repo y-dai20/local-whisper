@@ -396,7 +396,7 @@ pub(crate) async fn set_transcription_backend_config_impl(
     }
 
     if previous_mode != mode {
-        transcription::api_client::reset_all_connections();
+        transcription::api_client::reset_all_connections(APP_HANDLE.get());
     }
 
     info!("Updated transcription backend config: mode={}", mode);

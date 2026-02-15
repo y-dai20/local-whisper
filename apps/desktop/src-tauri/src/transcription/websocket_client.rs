@@ -34,6 +34,10 @@ struct SourceConnection {
     buffered_audio: Vec<f32>,
     buffered_start_sample: u64,
     total_input_samples: u64,
+    last_partial_text: Option<String>,
+    last_partial_message_id: u64,
+    last_partial_remote_session_id: Option<String>,
+    last_local_session_id: u64,
 }
 
 struct WebSocketTranscriptionClient {
@@ -45,6 +49,7 @@ static CLIENT: OnceCell<Mutex<WebSocketTranscriptionClient>> = OnceCell::new();
 static REMOTE_SESSION_ID_MAP: Lazy<Mutex<HashMap<String, u64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static NEXT_REMOTE_SESSION_ID: Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(2_000_000));
+static NEXT_FLUSH_AUDIO_ID: Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(9_000_000));
 const SAMPLE_RATE: u64 = 16_000;
 
 pub fn stream_audio_chunk_and_emit(
@@ -55,7 +60,7 @@ pub fn stream_audio_chunk_and_emit(
     is_final: bool,
     app_handle: &AppHandle,
 ) -> Result<(), String> {
-    let events = send_audio_to_websocket(audio_16k_f32, source, is_final)?;
+    let events = send_audio_to_websocket(audio_16k_f32, source, session_id_counter, is_final)?;
 
     for (event, event_audio) in events {
         let Some(text) = event.text.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()) else {
@@ -66,6 +71,27 @@ pub fn stream_audio_chunk_and_emit(
         let event_is_final = event.is_final.unwrap_or(is_final);
         let mapped_session_id =
             resolve_remote_session_id(event.session_id.as_deref(), session_id_counter);
+        if event_is_final {
+            match event_audio.as_ref() {
+                Some(audio) => log::info!(
+                    "WebSocket({}): final transcript has audio (session={}, message={}, samples={}, start={:?}, end={:?})",
+                    source.event_source(),
+                    mapped_session_id,
+                    message_id,
+                    audio.len(),
+                    event.start_seconds,
+                    event.end_seconds
+                ),
+                None => log::warn!(
+                    "WebSocket({}): final transcript has NO audio (session={}, message={}, start={:?}, end={:?})",
+                    source.event_source(),
+                    mapped_session_id,
+                    message_id,
+                    event.start_seconds,
+                    event.end_seconds
+                ),
+            }
+        }
 
         emit_transcription_segment(
             app_handle,
@@ -87,14 +113,34 @@ pub fn stream_audio_chunk_and_emit(
     Ok(())
 }
 
-pub fn reset_all_connections() {
+pub fn reset_all_connections(app_handle: Option<&AppHandle>) {
     if let Some(client) = CLIENT.get() {
         let mut guard = client.lock();
         log::info!(
             "WebSocket: resetting {} active source connection(s)",
             guard.connections.len()
         );
-        guard.connections.clear();
+        let pending: Vec<(TranscriptionSource, SourceConnection)> =
+            guard.connections.drain().collect();
+        drop(guard);
+
+        for (source, conn) in pending {
+            if !conn.buffered_audio.is_empty() {
+                let pending_audio = conn.buffered_audio.clone();
+                persist_remaining_audio_if_needed(
+                    source,
+                    pending_audio.clone(),
+                    "reset_all_connections",
+                );
+                emit_forced_final_if_possible(
+                    app_handle,
+                    source,
+                    &conn,
+                    pending_audio,
+                    "reset_all_connections",
+                );
+            }
+        }
     }
     REMOTE_SESSION_ID_MAP.lock().clear();
 }
@@ -102,6 +148,7 @@ pub fn reset_all_connections() {
 fn send_audio_to_websocket(
     audio_16k_f32: &[f32],
     source: TranscriptionSource,
+    session_id_counter: u64,
     is_final: bool,
 ) -> Result<Vec<(WebSocketTranscriptEvent, Option<Vec<f32>>)>, String> {
     if audio_16k_f32.is_empty() {
@@ -138,12 +185,31 @@ fn send_audio_to_websocket(
         .get_mut(&source)
         .ok_or_else(|| "WebSocket connection not found".to_string())?;
 
-    if conn.unhealthy.load(Ordering::Relaxed) {
+    let unhealthy = conn.unhealthy.load(Ordering::Relaxed);
+    if unhealthy {
         log::warn!(
             "WebSocket({}): connection unhealthy, dropping and requiring reconnect",
             source.event_source()
         );
-        guard.connections.remove(&source);
+        let removed = guard.connections.remove(&source);
+        drop(guard);
+        if let Some(conn) = removed {
+            if !conn.buffered_audio.is_empty() {
+                let pending_audio = conn.buffered_audio.clone();
+                persist_remaining_audio_if_needed(
+                    source,
+                    pending_audio.clone(),
+                    "connection_unhealthy",
+                );
+                emit_forced_final_if_possible(
+                    None,
+                    source,
+                    &conn,
+                    pending_audio,
+                    "connection_unhealthy",
+                );
+            }
+        }
         return Err("WebSocket connection became unhealthy".to_string());
     }
 
@@ -162,6 +228,7 @@ fn send_audio_to_websocket(
     conn.total_input_samples = conn
         .total_input_samples
         .wrapping_add(audio_16k_f32.len() as u64);
+    conn.last_local_session_id = session_id_counter;
 
     drain_events(conn)
 }
@@ -238,6 +305,10 @@ async fn create_connection(source: TranscriptionSource) -> Result<SourceConnecti
         buffered_audio: Vec::new(),
         buffered_start_sample: 0,
         total_input_samples: 0,
+        last_partial_text: None,
+        last_partial_message_id: 0,
+        last_partial_remote_session_id: None,
+        last_local_session_id: 0,
     })
 }
 
@@ -306,12 +377,24 @@ fn drain_events(
     let mut events = Vec::new();
     loop {
         match conn.transcript_rx.try_recv() {
-            Ok(event) => {
-                let event_audio = if event.is_final.unwrap_or(false) {
+            Ok(mut event) => {
+                let inferred_final = event.is_final.unwrap_or(false)
+                    || (event.start_seconds.is_some() && event.end_seconds.is_some());
+                if inferred_final {
+                    event.is_final = Some(true);
+                }
+                let event_audio = if inferred_final {
                     extract_audio_from_time_range(conn, event.start_seconds, event.end_seconds)
                 } else {
                     None
                 };
+                if inferred_final {
+                    conn.last_partial_text = None;
+                } else if let Some(text) = event.text.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+                    conn.last_partial_text = Some(text.to_string());
+                    conn.last_partial_message_id = event.chunk_index.unwrap_or(0);
+                    conn.last_partial_remote_session_id = event.session_id.clone();
+                }
                 events.push((event, event_audio));
             }
             Err(TryRecvError::Empty) => break,
@@ -353,7 +436,8 @@ fn transcript_event_from_value(
         is_final: value
             .get("is_final")
             .or_else(|| value.get("isFinal"))
-            .and_then(|v| v.as_bool()),
+            .or_else(|| value.get("final"))
+            .and_then(json_value_to_bool),
     })
 }
 
@@ -362,6 +446,27 @@ fn json_number_to_f64(value: &serde_json::Value) -> Option<f64> {
         .as_f64()
         .or_else(|| value.as_i64().map(|v| v as f64))
         .or_else(|| value.as_u64().map(|v| v as f64))
+}
+
+fn json_value_to_bool(value: &serde_json::Value) -> Option<bool> {
+    if let Some(v) = value.as_bool() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v != 0);
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v != 0);
+    }
+    if let Some(v) = value.as_str() {
+        let normalized = v.trim().to_lowercase();
+        return match normalized.as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        };
+    }
+    None
 }
 
 fn extract_audio_from_time_range(
@@ -398,10 +503,24 @@ fn extract_audio_from_time_range(
     let from = (start_sample - conn.buffered_start_sample) as usize;
     let to = (end_sample - conn.buffered_start_sample) as usize;
     if to <= from {
+        log::warn!(
+            "WebSocket: invalid extraction bounds from={} to={} (start_sample={}, end_sample={}, buffered_start={})",
+            from,
+            to,
+            start_sample,
+            end_sample,
+            conn.buffered_start_sample
+        );
         return None;
     }
 
     let extracted = conn.buffered_audio[from..to].to_vec();
+    log::info!(
+        "WebSocket: extracted audio samples={} for range [{}..{})",
+        extracted.len(),
+        start_sample,
+        end_sample
+    );
     prune_buffer_before_sample(conn, end_sample);
     Some(extracted)
 }
@@ -497,6 +616,112 @@ fn persist_api_audio_if_needed(
                 source_tag,
                 mapped_session_id,
                 message_id,
+                err
+            );
+        }
+    });
+}
+
+fn emit_forced_final_if_possible(
+    app_handle: Option<&AppHandle>,
+    source: TranscriptionSource,
+    conn: &SourceConnection,
+    audio: Vec<f32>,
+    reason: &str,
+) {
+    let Some(app_handle) = app_handle else {
+        return;
+    };
+    if audio.is_empty() {
+        return;
+    }
+    let Some(text) = conn
+        .last_partial_text
+        .as_ref()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+    else {
+        return;
+    };
+
+    let mapped_session_id = resolve_remote_session_id(
+        conn.last_partial_remote_session_id.as_deref(),
+        conn.last_local_session_id,
+    );
+    let message_id = conn.last_partial_message_id;
+
+    log::info!(
+        "WebSocket({}): emitting forced final segment on {} (session={}, message={}, samples={})",
+        source.event_source(),
+        reason,
+        mapped_session_id,
+        message_id,
+        audio.len()
+    );
+
+    if let Err(err) = emit_transcription_segment(
+        app_handle,
+        text.to_string(),
+        Some(audio),
+        mapped_session_id,
+        message_id,
+        true,
+        source.event_source().to_string(),
+    ) {
+        log::warn!(
+            "WebSocket({}): failed to emit forced final segment on {}: {}",
+            source.event_source(),
+            reason,
+            err
+        );
+    }
+}
+
+fn persist_remaining_audio_if_needed(source: TranscriptionSource, audio: Vec<f32>, reason: &str) {
+    if audio.is_empty() {
+        return;
+    }
+
+    let Some(state) = try_recording_state() else {
+        return;
+    };
+    let guard = state.lock();
+    if !guard.recording_save_enabled || !guard.is_recording {
+        return;
+    }
+    let Some(recording_dir) = guard.current_recording_dir.clone() else {
+        return;
+    };
+    drop(guard);
+
+    let source_tag = match source {
+        TranscriptionSource::Mic => "mic",
+        TranscriptionSource::System => "system",
+    };
+
+    let synthetic_session_id = {
+        let mut id = NEXT_FLUSH_AUDIO_ID.lock();
+        *id = id.wrapping_add(1);
+        *id
+    };
+
+    let duration_sec = audio.len() as f64 / SAMPLE_RATE as f64;
+    let reason_owned = reason.to_string();
+    log::info!(
+        "WebSocket({}): persisting remaining buffered audio ({:.2}s, reason={})",
+        source_tag,
+        duration_sec,
+        reason_owned
+    );
+
+    std::thread::spawn(move || {
+        if let Err(err) =
+            save_audio_session_to_wav(&audio, synthetic_session_id, &recording_dir, source_tag)
+        {
+            log::error!(
+                "Failed to save remaining buffered {} audio (reason={}): {}",
+                source_tag,
+                reason_owned,
                 err
             );
         }

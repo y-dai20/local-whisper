@@ -21,6 +21,6 @@ pub fn stream_audio_chunk_and_emit(
     )
 }
 
-pub fn reset_all_connections() {
-    websocket_client::reset_all_connections();
+pub fn reset_all_connections(app_handle: Option<&AppHandle>) {
+    websocket_client::reset_all_connections(app_handle);
 }

@@ -405,6 +405,15 @@ pub fn start_system_audio_capture(
 
 pub fn stop_system_audio_capture(state: Arc<ParkingMutex<RecordingState>>) -> Result<(), String> {
     unsafe {
+        // Flush pending local/system session before tearing down globals.
+        finalize_active_system_audio_session("system_audio_capture_stopped");
+        // Flush pending API websocket buffers and force-finalize remaining segments.
+        let app_handle = {
+            let app_handle_ptr = addr_of!(APP_HANDLE);
+            (*app_handle_ptr).clone()
+        };
+        crate::transcription::api_client::reset_all_connections(app_handle.as_ref());
+
         let result = system_audio_stop();
 
         let mut state_guard = state.lock();
