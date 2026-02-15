@@ -35,6 +35,13 @@ static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCe
 static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 static SHUTDOWN_CLEANED: AtomicBool = AtomicBool::new(false);
 
+fn load_backend_env() {
+    // Rust side does not auto-load .env; load common locations explicitly.
+    for path in [".env", "src-tauri/.env"] {
+        let _ = dotenvy::from_filename(path);
+    }
+}
+
 pub(crate) fn emit_transcription_segment(
     app_handle: &AppHandle,
     text: String,
@@ -173,8 +180,6 @@ pub struct TranscriptionBackendConfig {
     pub mode: String,
 }
 
-
-
 pub(crate) async fn start_recording_impl(language: Option<String>) -> Result<(), String> {
     let state = try_recording_state().ok_or("Recording not initialized")?;
 
@@ -263,7 +268,14 @@ pub(crate) async fn stop_mic_impl() -> Result<(), String> {
 
     state_guard.is_muted = true;
 
-    finalize_active_session(&mut state_guard, "mic_stopped");
+    if state_guard.transcription_mode != "api" {
+        finalize_active_session(&mut state_guard, "mic_stopped");
+    } else {
+        state_guard.session_audio.clear();
+        state_guard.session_samples = 0;
+        state_guard.last_partial_emit_samples = 0;
+        state_guard.last_voice_sample = None;
+    }
     stop_transcription_worker(&mut state_guard);
     state_guard.vad_state = None;
 
@@ -367,7 +379,19 @@ pub(crate) async fn set_transcription_backend_config_impl(
 
     let state = recording_state();
     let mut state_guard = state.lock();
-    state_guard.transcription_mode = mode.clone();
+    let previous_mode = state_guard.transcription_mode.clone();
+
+    if previous_mode == "local" && mode == "api" {
+        if !state_guard.is_muted {
+            finalize_active_session(&mut state_guard, "mode_switch_local_to_api");
+        }
+        drop(state_guard);
+        system_audio::finalize_active_system_audio_session("mode_switch_local_to_api");
+        let mut state_guard = state.lock();
+        state_guard.transcription_mode = mode.clone();
+    } else {
+        state_guard.transcription_mode = mode.clone();
+    }
 
     info!("Updated transcription backend config: mode={}", mode);
 
@@ -622,6 +646,8 @@ fn cleanup_on_exit() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    load_backend_env();
+
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .try_init();

@@ -2,6 +2,7 @@ use crate::audio::{
     try_recording_state, RecordingState, SILENCE_TIMEOUT_SAMPLES, VAD_CHUNK_SIZE,
     VAD_POST_BUFFER_SAMPLES, VAD_PRE_BUFFER_SAMPLES, VAD_SAMPLE_RATE,
 };
+use crate::transcription::webrtc_client::stream_audio_chunk_and_emit;
 use crate::transcription::worker::queue_transcription_with_source;
 use crate::transcription::{spawn_transcription_worker, TranscriptionSource};
 use log::{error, info};
@@ -9,9 +10,7 @@ use parking_lot::Mutex as ParkingMutex;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr::{addr_of, addr_of_mut};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 use tauri::AppHandle;
 use voice_activity_detector::VoiceActivityDetector;
 extern "C" {
@@ -38,9 +37,6 @@ struct SystemAudioSession {
 static mut SYSTEM_AUDIO_SESSION: Option<SystemAudioSession> = None;
 static mut APP_HANDLE: Option<AppHandle> = None;
 static mut RECORDING_STATE: Option<Arc<ParkingMutex<RecordingState>>> = None;
-static SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
-static LAST_LOG_INSTANT: Mutex<Option<Instant>> = Mutex::new(None);
-const LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 fn reset_system_audio_session_tracking(session: &mut SystemAudioSession) {
     session.session_audio.clear();
@@ -95,6 +91,7 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
         let app_handle_ptr = addr_of!(APP_HANDLE);
         let app_handle = (*app_handle_ptr).as_ref();
         let language = state.language.clone();
+        let api_stream_mode = state.transcription_mode == "api";
         let session_id_counter = state
             .transcription_state(TranscriptionSource::System)
             .session_id_counter;
@@ -106,48 +103,44 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
         }
 
         let slice = std::slice::from_raw_parts(samples, count as usize);
-
-        let mut sum_squares = 0.0_f32;
-        let mut max_sample = 0.0_f32;
-        for &sample in slice {
-            sum_squares += sample * sample;
-            max_sample = max_sample.max(sample.abs());
-
-            process_system_audio_sample(
-                session,
-                sample,
-                app_handle,
-                language.as_deref(),
-                session_id_counter,
-            );
+        if slice.is_empty() {
+            return;
         }
 
-        let rms = if count > 0 {
-            (sum_squares / count as f32).sqrt()
+        if api_stream_mode {
+            if let Some(app) = app_handle {
+                let now = std::time::Instant::now();
+                if now.duration_since(session.last_vad_event_time).as_millis() >= 500 {
+                    super::emit_voice_activity_event(app, "system", true, session_id_counter);
+                    session.last_vad_event_time = now;
+                }
+
+                if let Err(err) = stream_audio_chunk_and_emit(
+                    slice,
+                    language.as_deref().unwrap_or("ja"),
+                    TranscriptionSource::System,
+                    session_id_counter,
+                    false,
+                    app,
+                ) {
+                    error!("Failed to stream system audio chunk to API: {}", err);
+                }
+            }
         } else {
-            0.0
-        };
-
-        let total_samples =
-            SAMPLE_COUNTER.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
-        let mut last_log = LAST_LOG_INSTANT.lock().unwrap();
-        let now = Instant::now();
-        let should_log = last_log
-            .map(|ts| now.duration_since(ts) >= LOG_INTERVAL)
-            .unwrap_or(true);
-
-        if should_log {
-            let total_seconds = total_samples as f32 / 16000.0;
-            info!(
-                "System audio: received {} samples (total {:.2}s, RMS {:.4})",
-                count, total_seconds, rms
-            );
-            *last_log = Some(now);
+            for &sample in slice {
+                process_system_audio_sample_local(
+                    session,
+                    sample,
+                    app_handle,
+                    language.as_deref(),
+                    session_id_counter,
+                );
+            }
         }
     }
 }
 
-fn process_system_audio_sample(
+fn process_system_audio_sample_local(
     session: &mut SystemAudioSession,
     sample: f32,
     app_handle: Option<&AppHandle>,
@@ -322,6 +315,25 @@ fn finalize_system_audio_session(
     session.is_voice_active = false;
 }
 
+pub fn finalize_active_system_audio_session(reason: &str) {
+    unsafe {
+        let session_ptr = addr_of_mut!(SYSTEM_AUDIO_SESSION);
+        let Some(session) = (*session_ptr).as_mut() else {
+            return;
+        };
+
+        let app_handle_ptr = addr_of!(APP_HANDLE);
+        let app_handle = (*app_handle_ptr).as_ref();
+
+        let state_ptr = addr_of!(RECORDING_STATE);
+        let language = (*state_ptr)
+            .as_ref()
+            .and_then(|state_arc| state_arc.lock().language.clone());
+
+        finalize_system_audio_session(session, reason, app_handle, language.as_deref());
+    }
+}
+
 pub fn start_system_audio_capture(
     state: Arc<ParkingMutex<RecordingState>>,
     app_handle: AppHandle,
@@ -365,7 +377,6 @@ pub fn start_system_audio_capture(
 
         APP_HANDLE = Some(app_handle);
         RECORDING_STATE = Some(state.clone());
-        SAMPLE_COUNTER.store(0, Ordering::Relaxed);
 
         let result = system_audio_start(audio_callback);
 

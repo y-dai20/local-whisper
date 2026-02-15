@@ -90,18 +90,15 @@ interface TranscriptionBackendConfig {
   mode: "local" | "api";
 }
 
-interface ApiTranscriptEvent {
-  session_id: string;
-  chunk_index: number;
-  text: string;
-  is_final: boolean;
-  created_at: string;
-}
-
 interface SummaryResponse {
   summary?: string;
   text?: string;
   result?: string;
+}
+
+interface BackendErrorEvent {
+  message: string;
+  fallbackMode?: "local" | "api";
 }
 
 const API_BASE_URL =
@@ -174,14 +171,66 @@ function App() {
   const transcriptionSuppressedForPlaybackRef = useRef(false);
   const copyFeedbackTimeoutRef = useRef<number | null>(null);
   const copyAllFeedbackTimeoutRef = useRef<number | null>(null);
-  const apiPeerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const apiLocalStreamRef = useRef<MediaStream | null>(null);
-  const apiEventsSocketRef = useRef<WebSocket | null>(null);
-  const apiSessionServerIdRef = useRef<string | null>(null);
-  const apiSessionLocalIdRef = useRef<number | null>(null);
-  const apiDraftMessageIdRef = useRef<number | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const previousMessageCountRef = useRef(0);
+  const previousScrollHeightRef = useRef(0);
+
+  const upsertTranscriptionSegment = useCallback(
+    (segment: TranscriptionSegment) => {
+      setTranscriptions((prev) => {
+        const sessionKey = `${segment.source}-${segment.sessionId}`;
+        const sessions = [...prev];
+        const sessionIndex = sessions.findIndex((s) => s.sessionKey === sessionKey);
+
+        const upsertMessages = (existing: TranscriptionSegment[] | undefined) => {
+          if (!existing) {
+            return [segment];
+          }
+          const messages = [...existing];
+          const messageIndex = messages.findIndex((m) => m.messageId === segment.messageId);
+          if (messageIndex >= 0) {
+            messages[messageIndex] = segment;
+          } else {
+            messages.push(segment);
+          }
+          messages.sort((a, b) => a.messageId - b.messageId);
+          return messages;
+        };
+
+        const upsertAudioChunks = (existing: Record<number, number[]> | undefined) => {
+          const chunks = { ...(existing || {}) };
+          if (segment.audioData?.length) {
+            chunks[segment.messageId] = segment.audioData;
+          }
+          return chunks;
+        };
+
+        if (sessionIndex >= 0) {
+          const session = sessions[sessionIndex];
+          sessions[sessionIndex] = {
+            ...session,
+            messages: upsertMessages(session.messages),
+            audioChunks: upsertAudioChunks(session.audioChunks),
+          };
+          return sessions;
+        }
+
+        return [
+          ...sessions,
+          {
+            sessionKey,
+            sessionId: segment.sessionId,
+            source: segment.source,
+            messages: [segment],
+            audioChunks: segment.audioData?.length
+              ? { [segment.messageId]: segment.audioData }
+              : {},
+          },
+        ];
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
@@ -310,7 +359,11 @@ function App() {
         setError("録画保存を有効にして保存先フォルダを設定してください");
         return;
       }
-      if (!screenRecordingEnabled && !isInitialized) {
+      if (
+        transcriptionMode === "local" &&
+        !screenRecordingEnabled &&
+        !isInitialized
+      ) {
         setError("録画を開始する前にモデルを初期化してください");
         return;
       }
@@ -533,66 +586,7 @@ function App() {
         const segment = event.payload;
 
         console.log("[App] Received transcription segment:", segment);
-
-        setTranscriptions((prev) => {
-          const sessionKey = `${segment.source}-${segment.sessionId}`;
-          const sessions = [...prev];
-          const sessionIndex = sessions.findIndex(
-            (s) => s.sessionKey === sessionKey,
-          );
-
-          const upsertMessages = (
-            existing: TranscriptionSegment[] | undefined,
-          ) => {
-            if (!existing) {
-              return [segment];
-            }
-            const messages = [...existing];
-            const messageIndex = messages.findIndex(
-              (m) => m.messageId === segment.messageId,
-            );
-            if (messageIndex >= 0) {
-              messages[messageIndex] = segment;
-            } else {
-              messages.push(segment);
-            }
-            messages.sort((a, b) => a.messageId - b.messageId);
-            return messages;
-          };
-
-          const upsertAudioChunks = (
-            existing: Record<number, number[]> | undefined,
-          ) => {
-            const chunks = { ...(existing || {}) };
-            if (segment.audioData?.length) {
-              chunks[segment.messageId] = segment.audioData;
-            }
-            return chunks;
-          };
-
-          if (sessionIndex >= 0) {
-            const session = sessions[sessionIndex];
-            sessions[sessionIndex] = {
-              ...session,
-              messages: upsertMessages(session.messages),
-              audioChunks: upsertAudioChunks(session.audioChunks),
-            };
-            return sessions;
-          }
-
-          return [
-            ...sessions,
-            {
-              sessionKey,
-              sessionId: segment.sessionId,
-              source: segment.source,
-              messages: [segment],
-              audioChunks: segment.audioData?.length
-                ? { [segment.messageId]: segment.audioData }
-                : {},
-            },
-          ];
-        });
+        upsertTranscriptionSegment(segment);
       },
     );
 
@@ -613,6 +607,19 @@ function App() {
       },
     );
 
+    const unlistenBackendError = listen<BackendErrorEvent>(
+      "backend-error",
+      (event) => {
+        const payload = event.payload;
+        if (payload.message) {
+          setError(payload.message);
+        }
+        if (payload.fallbackMode === "local") {
+          setTranscriptionMode("local");
+        }
+      },
+    );
+
     loadSettingsFromLocalStorage();
     refreshAllModels();
     loadLanguages();
@@ -627,8 +634,9 @@ function App() {
     return () => {
       unlistenTranscription.then((fn) => fn());
       unlistenVoiceActivity.then((fn) => fn());
+      unlistenBackendError.then((fn) => fn());
     };
-  }, [loadStreamingConfig, loadWhisperParams, loadTranscriptionBackendConfig]);
+  }, [loadStreamingConfig, loadWhisperParams, loadTranscriptionBackendConfig, upsertTranscriptionSegment]);
 
   const getTotalMessageCount = useCallback(
     (sessions: SessionTranscription[]) =>
@@ -658,22 +666,33 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const container = scrollContainerRef.current;
+    const currentHeight = container?.scrollHeight ?? 0;
+    const previousHeight = previousScrollHeightRef.current;
+    const grewInHeight = currentHeight > previousHeight;
+    previousScrollHeightRef.current = currentHeight;
+
     const currentCount = getTotalMessageCount(transcriptions);
     const previousCount = previousMessageCountRef.current;
     const incomingCount = Math.max(0, currentCount - previousCount);
     previousMessageCountRef.current = currentCount;
 
-    if (incomingCount === 0) {
+    if (incomingCount === 0 && !grewInHeight) {
       return;
     }
 
     if (isAutoScrollPaused) {
-      setNewMessageCount((prev) => prev + incomingCount);
+      setNewMessageCount((prev) => prev + (incomingCount > 0 ? incomingCount : 1));
       return;
     }
 
     scrollToBottom("smooth");
-  }, [getTotalMessageCount, isAutoScrollPaused, scrollToBottom, transcriptions]);
+  }, [
+    getTotalMessageCount,
+    isAutoScrollPaused,
+    scrollToBottom,
+    transcriptions,
+  ]);
 
   useEffect(() => {
     if (selectedModel) {
@@ -772,10 +791,6 @@ function App() {
   const handleTranscriptionModeChange = async (nextMode: "local" | "api") => {
     if (nextMode === transcriptionMode) {
       return;
-    }
-
-    if (!isMuted) {
-      await stopMic();
     }
 
     await saveTranscriptionBackendConfig({
@@ -926,282 +941,6 @@ function App() {
     }
   };
 
-  const apiHttpToWsUrl = (url: string) => {
-    if (url.startsWith("https://")) {
-      return `wss://${url.slice("https://".length)}`;
-    }
-    if (url.startsWith("http://")) {
-      return `ws://${url.slice("http://".length)}`;
-    }
-    return url;
-  };
-
-  const appendApiTranscript = (
-    text: string,
-    isFinal: boolean,
-    createdAt: string,
-    chunkIndex: number,
-  ) => {
-    const sessionId = apiSessionLocalIdRef.current;
-    if (sessionId === null || !text.trim()) {
-      return;
-    }
-
-    const segment: TranscriptionSegment = {
-      text,
-      timestamp: new Date(createdAt).getTime(),
-      sessionId,
-      messageId: chunkIndex,
-      isFinal,
-      source: "user",
-    };
-
-    setTranscriptions((prev) => {
-      const sessionKey = `${segment.source}-${segment.sessionId}`;
-      const sessions = [...prev];
-      const sessionIndex = sessions.findIndex(
-        (s) => s.sessionKey === sessionKey,
-      );
-
-      if (sessionIndex >= 0) {
-        const session = sessions[sessionIndex];
-        const nextMessages = [...session.messages];
-        const draftMessageId = apiDraftMessageIdRef.current;
-
-        if (!isFinal) {
-          if (draftMessageId !== null) {
-            const draftIndex = nextMessages.findIndex(
-              (message) => message.messageId === draftMessageId,
-            );
-            if (draftIndex >= 0) {
-              nextMessages[draftIndex] = {
-                ...nextMessages[draftIndex],
-                text: segment.text,
-                timestamp: segment.timestamp,
-                isFinal: false,
-              };
-              sessions[sessionIndex] = {
-                ...session,
-                messages: nextMessages,
-              };
-              return sessions;
-            }
-          }
-          nextMessages.push(segment);
-          apiDraftMessageIdRef.current = segment.messageId;
-        } else {
-          if (draftMessageId !== null) {
-            const draftIndex = nextMessages.findIndex(
-              (message) => message.messageId === draftMessageId,
-            );
-            if (draftIndex >= 0) {
-              nextMessages[draftIndex] = {
-                ...nextMessages[draftIndex],
-                text: segment.text,
-                timestamp: segment.timestamp,
-                isFinal: true,
-              };
-            } else {
-              const existingIndex = nextMessages.findIndex(
-                (message) => message.messageId === segment.messageId,
-              );
-              if (existingIndex >= 0) {
-                nextMessages[existingIndex] = segment;
-              } else {
-                nextMessages.push(segment);
-              }
-            }
-          } else {
-            const existingIndex = nextMessages.findIndex(
-              (message) => message.messageId === segment.messageId,
-            );
-            if (existingIndex >= 0) {
-              nextMessages[existingIndex] = segment;
-            } else {
-              nextMessages.push(segment);
-            }
-          }
-          apiDraftMessageIdRef.current = null;
-        }
-
-        nextMessages.sort((a, b) => a.messageId - b.messageId);
-        sessions[sessionIndex] = {
-          ...session,
-          messages: nextMessages,
-        };
-        return sessions;
-      }
-
-      return [
-        ...sessions,
-        {
-          sessionKey,
-          sessionId: segment.sessionId,
-          source: segment.source,
-          messages: [segment],
-          audioChunks: {},
-        },
-      ];
-    });
-
-    if (!isFinal) {
-      apiDraftMessageIdRef.current = segment.messageId;
-    } else {
-      apiDraftMessageIdRef.current = null;
-    }
-  };
-
-  const stopApiMic = async () => {
-    // Mute immediately on client side first.
-    setIsMuted(true);
-
-    const eventsSocket = apiEventsSocketRef.current;
-    if (eventsSocket) {
-      eventsSocket.close();
-      apiEventsSocketRef.current = null;
-    }
-
-    const stream = apiLocalStreamRef.current;
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-      apiLocalStreamRef.current = null;
-    }
-
-    const peerConnection = apiPeerConnectionRef.current;
-    if (peerConnection) {
-      peerConnection.getSenders().forEach((sender) => sender.track?.stop());
-      peerConnection.close();
-      apiPeerConnectionRef.current = null;
-    }
-
-    const sessionId = apiSessionServerIdRef.current;
-    apiSessionServerIdRef.current = null;
-    apiSessionLocalIdRef.current = null;
-    apiDraftMessageIdRef.current = null;
-
-    if (sessionId) {
-      const baseUrl = API_BASE_URL.replace(/\/$/, "");
-      const closeController = new AbortController();
-      const closeTimeout = window.setTimeout(
-        () => closeController.abort(),
-        1500,
-      );
-      void fetch(`${baseUrl}/api/sessions/${sessionId}`, {
-        method: "DELETE",
-        signal: closeController.signal,
-      })
-        .catch((err) => {
-          console.error("Failed to close API session:", err);
-        })
-        .finally(() => {
-          window.clearTimeout(closeTimeout);
-        });
-    }
-  };
-
-  const startApiMic = async () => {
-    try {
-      const baseUrl = API_BASE_URL.replace(/\/$/, "");
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-      });
-      const peerConnection = new RTCPeerConnection();
-
-      for (const track of mediaStream.getAudioTracks()) {
-        peerConnection.addTrack(track, mediaStream);
-      }
-
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
-
-      const localDescription = peerConnection.localDescription;
-      if (!localDescription) {
-        throw new Error("Failed to create local offer");
-      }
-
-      const offerController = new AbortController();
-      const offerTimeout = window.setTimeout(
-        () => offerController.abort(),
-        10000,
-      );
-      let response: Response;
-      try {
-        response = await fetch(`${baseUrl}/api/webrtc/offer`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            sdp: localDescription.sdp,
-            type: localDescription.type,
-          }),
-          signal: offerController.signal,
-        });
-      } finally {
-        window.clearTimeout(offerTimeout);
-      }
-
-      if (!response.ok) {
-        throw new Error(`Offer request failed: ${response.status}`);
-      }
-
-      const answer = (await response.json()) as {
-        session_id: string;
-        sdp: string;
-        type: RTCSdpType;
-      };
-
-      await peerConnection.setRemoteDescription(
-        new RTCSessionDescription({
-          sdp: answer.sdp,
-          type: answer.type,
-        }),
-      );
-
-      const ws = new WebSocket(
-        `${apiHttpToWsUrl(baseUrl)}/api/sessions/${answer.session_id}/events`,
-      );
-      ws.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data) as
-            | ApiTranscriptEvent
-            | { error: string };
-          if ("error" in payload) {
-            if (payload.error === "session_not_found") {
-              setError("APIセッションが見つかりません");
-            }
-            return;
-          }
-          appendApiTranscript(
-            payload.text,
-            payload.is_final,
-            payload.created_at,
-            payload.chunk_index,
-          );
-        } catch (err) {
-          console.error("Failed to parse transcript event:", err);
-        }
-      };
-      ws.onerror = () => {
-        setError("APIイベント接続エラー");
-      };
-
-      apiLocalStreamRef.current = mediaStream;
-      apiPeerConnectionRef.current = peerConnection;
-      apiEventsSocketRef.current = ws;
-      apiSessionServerIdRef.current = answer.session_id;
-      apiSessionLocalIdRef.current = Date.now();
-      apiDraftMessageIdRef.current = null;
-
-      setIsMuted(false);
-      setError("");
-    } catch (err) {
-      console.error("API mic start error:", err);
-      await stopApiMic();
-      setError(
-        `APIマイク開始エラー: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  };
-
   const startMic = async () => {
     if (isMicBusy) {
       return;
@@ -1209,13 +948,7 @@ function App() {
 
     setIsMicBusy(true);
 
-    if (transcriptionMode === "api") {
-      await startApiMic();
-      setIsMicBusy(false);
-      return;
-    }
-
-    if (!isInitialized) {
+    if (transcriptionMode === "local" && !isInitialized) {
       setError("モデルを初期化中です...");
       setIsMicBusy(false);
       return;
@@ -1243,12 +976,6 @@ function App() {
     }
 
     setIsMicBusy(true);
-
-    if (transcriptionMode === "api") {
-      await stopApiMic();
-      setIsMicBusy(false);
-      return;
-    }
 
     setIsMuted(true);
 
@@ -1382,12 +1109,6 @@ function App() {
       if (copyAllFeedbackTimeoutRef.current) {
         window.clearTimeout(copyAllFeedbackTimeoutRef.current);
       }
-      apiEventsSocketRef.current?.close();
-      apiEventsSocketRef.current = null;
-      apiLocalStreamRef.current?.getTracks().forEach((track) => track.stop());
-      apiLocalStreamRef.current = null;
-      apiPeerConnectionRef.current?.close();
-      apiPeerConnectionRef.current = null;
     };
   }, []);
 
@@ -1500,9 +1221,13 @@ function App() {
   const pendingUserSessionKey = isPendingVoiceSession("user");
   const pendingSystemSessionKey = isPendingVoiceSession("system");
   const showUserActivityIndicator =
-    voiceActivity.user.isActive && !pendingUserSessionKey;
+    transcriptionMode !== "api" &&
+    voiceActivity.user.isActive &&
+    !pendingUserSessionKey;
   const showSystemActivityIndicator =
-    voiceActivity.system.isActive && !pendingSystemSessionKey;
+    transcriptionMode !== "api" &&
+    voiceActivity.system.isActive &&
+    !pendingSystemSessionKey;
 
   return (
     <div className="flex flex-col h-screen w-screen bg-base-100">

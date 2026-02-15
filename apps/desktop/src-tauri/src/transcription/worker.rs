@@ -2,9 +2,9 @@ use asr_core::TranscribedSegment;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
+use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use tauri::AppHandle;
-use std::sync::mpsc::Sender;
 
 use crate::audio::constants::VAD_SAMPLE_RATE;
 use crate::audio::state::{try_recording_state, RecordingState};

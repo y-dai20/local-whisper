@@ -9,7 +9,9 @@ use crate::audio::constants::{VAD_CHUNK_SIZE, VAD_SAMPLE_RATE};
 use crate::audio::processing::finalize_active_session;
 use crate::audio::state::{recording_state, SileroVadState};
 use crate::audio::utils::resample_audio;
-use crate::transcription::{spawn_transcription_worker};
+use crate::emit_voice_activity_event;
+use crate::transcription::webrtc_client::stream_audio_chunk_and_emit;
+use crate::transcription::{spawn_transcription_worker, TranscriptionSource};
 use crate::transcription::worker::stop_transcription_worker;
 
 pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -> Result<(), String> {
@@ -131,6 +133,7 @@ pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -
             device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut api_payload: Option<(Vec<f32>, String, u64)> = None;
                     let mut state = state_clone.lock();
                     if !state.is_muted && state.mic_stream_id == current_mic_stream_id {
                         let mono_samples: Vec<f32> = data.iter().step_by(channels).copied().collect();
@@ -139,11 +142,40 @@ pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -
                         } else {
                             resample_audio(&mono_samples, device_sample_rate, VAD_SAMPLE_RATE)
                         };
-                        for sample in processed_samples {
-                            crate::audio::processing::push_sample_with_optional_vad(&mut state, sample, &app_handle_clone);
+
+                        if state.transcription_mode == "api" {
+                            if !state.suppress_transcription {
+                                let language = state
+                                    .language
+                                    .clone()
+                                    .unwrap_or_else(|| "ja".to_string());
+                                let session_id_counter = state
+                                    .transcription_state(TranscriptionSource::Mic)
+                                    .session_id_counter;
+                                api_payload = Some((processed_samples, language, session_id_counter));
+                            }
+
+                            let now = std::time::Instant::now();
+                            if now.duration_since(state.last_vad_event_time).as_millis() >= 500 {
+                                let session_id = state
+                                    .transcription_state(TranscriptionSource::Mic)
+                                    .session_id_counter;
+                                emit_voice_activity_event(&app_handle_clone, "user", true, session_id);
+                                state.last_vad_event_time = now;
+                            }
+                        } else {
+                            for sample in processed_samples {
+                                crate::audio::processing::push_sample_with_optional_vad(
+                                    &mut state,
+                                    sample,
+                                    &app_handle_clone,
+                                );
+                            }
                         }
 
-                        if state.session_samples >= state.session_max_samples {
+                        if state.transcription_mode != "api"
+                            && state.session_samples >= state.session_max_samples
+                        {
                             finalize_active_session(&mut state, "session_max_duration");
                         }
                         let mut count = callback_count.lock();
@@ -152,6 +184,20 @@ pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -
                             info!("Audio callback #{}: received {} samples, buffer size: {} samples ({:.2}s)",
                                      *count, data.len(),
                                      state.audio_buffer.len(), state.audio_buffer.len() as f32 / VAD_SAMPLE_RATE as f32);
+                        }
+                    }
+                    drop(state);
+
+                    if let Some((audio, language, session_id_counter)) = api_payload {
+                        if let Err(err) = stream_audio_chunk_and_emit(
+                            &audio,
+                            &language,
+                            TranscriptionSource::Mic,
+                            session_id_counter,
+                            false,
+                            &app_handle_clone,
+                        ) {
+                            error!("Failed to stream mic audio chunk to API: {}", err);
                         }
                     }
                 },
