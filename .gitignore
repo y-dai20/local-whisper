@@ -30,3 +30,4 @@ apps/desktop/src-tauri/gen/
 
 # Whisper models (optional - uncomment if you don't want to commit models)
 # vendor/whisper.cpp/models/*.bin
+.tmp-signing

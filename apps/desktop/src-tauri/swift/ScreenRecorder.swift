@@ -36,9 +36,9 @@ class ScreenRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         config.channelCount = 2
         config.excludesCurrentProcessAudio = false
 
-        // マイク音声もキャプチャ (macOS 15.0+)
+        // macOS 15 SDK 未満でもコンパイルできるように KVC で設定する
         if #available(macOS 15.0, *) {
-            config.captureMicrophone = true
+            config.setValue(true, forKey: "captureMicrophone")
         }
 
         let assetWriter = try AVAssetWriter(url: url, fileType: .mp4)
@@ -104,9 +104,13 @@ class ScreenRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: DispatchQueue(label: "com.local-whisper.screen"))
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.local-whisper.recording-audio"))
 
-        // マイク音声の出力ストリームを追加 (macOS 15.0+)
-        if #available(macOS 15.0, *) {
-            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: DispatchQueue(label: "com.local-whisper.recording-microphone"))
+        // macOS 15 SDK 未満でもコンパイルできるように enum case を直接参照しない
+        if #available(macOS 15.0, *), let microphoneType = SCStreamOutputType(rawValue: 2) {
+            try stream.addStreamOutput(
+                self,
+                type: microphoneType,
+                sampleHandlerQueue: DispatchQueue(label: "com.local-whisper.recording-microphone")
+            )
         }
 
         try await stream.startCapture()
@@ -166,6 +170,14 @@ class ScreenRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
             assetWriter?.startSession(atSourceTime: startTime!)
         }
 
+        if #available(macOS 15.0, *), type.rawValue == 2 {
+            // マイク音声は専用のトラックに保存
+            if let microphoneInput = self.microphoneInput, microphoneInput.isReadyForMoreMediaData {
+                microphoneInput.append(sampleBuffer)
+            }
+            return
+        }
+
         switch type {
         case .screen:
             if let videoInput = self.videoInput,
@@ -182,11 +194,6 @@ class ScreenRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         case .audio:
             if let audioInput = self.audioInput, audioInput.isReadyForMoreMediaData {
                 audioInput.append(sampleBuffer)
-            }
-        case .microphone:
-            // マイク音声は専用のトラックに保存
-            if let microphoneInput = self.microphoneInput, microphoneInput.isReadyForMoreMediaData {
-                microphoneInput.append(sampleBuffer)
             }
         @unknown default:
             break
