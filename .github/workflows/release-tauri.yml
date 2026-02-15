@@ -1,0 +1,75 @@
+name: Release Tauri App
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - macos-14
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare App Store Connect API key
+        shell: bash
+        run: |
+          mkdir -p private_keys
+          echo "${{ secrets.APPLE_API_KEY_CONTENT_BASE64 }}" | base64 --decode > "private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8"
+          chmod 600 "private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8"
+          echo "APPLE_API_KEY_PATH=${GITHUB_WORKSPACE}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8" >> "$GITHUB_ENV"
+
+      - name: Build, Sign, Notarize and Release (macOS)
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: local-whisper ${{ github.ref_name }}
+          releaseBody: |
+            Automated release for ${{ github.ref_name }}.
+          releaseDraft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # Apple code signing
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+          # APPLE_SIGNING_IDENTITY is optional in Tauri v2 when inferable from APPLE_CERTIFICATE.
+          # If needed, uncomment the next line and set the secret.
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+
+          # Apple notarization via App Store Connect API key (recommended)
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
