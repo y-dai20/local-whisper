@@ -6,7 +6,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
@@ -34,6 +34,8 @@ use transcription::worker::stop_transcription_worker;
 static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCell::new();
 static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 static SHUTDOWN_CLEANED: AtomicBool = AtomicBool::new(false);
+static API_STREAM_FAILURE_STREAK: AtomicU32 = AtomicU32::new(0);
+const API_STREAM_FAILURE_LIMIT: u32 = 10;
 
 fn load_backend_env() {
     // Rust side does not auto-load .env; load common locations explicitly.
@@ -180,6 +182,13 @@ pub struct TranscriptionBackendConfig {
     pub mode: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct BackendErrorEvent {
+    message: String,
+    #[serde(rename = "fallbackMode", skip_serializing_if = "Option::is_none")]
+    fallback_mode: Option<String>,
+}
+
 pub(crate) async fn start_recording_impl(language: Option<String>) -> Result<(), String> {
     let state = try_recording_state().ok_or("Recording not initialized")?;
 
@@ -311,6 +320,55 @@ pub(crate) fn emit_voice_activity_event(
     }
 }
 
+pub(crate) fn mark_api_stream_success() {
+    if API_STREAM_FAILURE_STREAK.load(Ordering::Relaxed) != 0 {
+        API_STREAM_FAILURE_STREAK.store(0, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn handle_api_stream_failure(app_handle: &AppHandle, source: &str, err: &str) {
+    let failures = API_STREAM_FAILURE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures < API_STREAM_FAILURE_LIMIT {
+        return;
+    }
+
+    let state = recording_state();
+    let mut state_guard = state.lock();
+    if state_guard.transcription_mode != "api" {
+        return;
+    }
+
+    state_guard.transcription_mode = "local".to_string();
+    if !state_guard.is_muted {
+        finalize_active_session(&mut state_guard, "api_stream_failure_fallback");
+    }
+    drop(state_guard);
+
+    API_STREAM_FAILURE_STREAK.store(0, Ordering::Relaxed);
+    system_audio::finalize_active_system_audio_session("api_stream_failure_fallback");
+    transcription::api_client::reset_all_connections(APP_HANDLE.get());
+
+    let message = format!(
+        "API接続に{}回連続で失敗したため、Proモードをローカルモードに切り替えました。最後のエラー: {}",
+        API_STREAM_FAILURE_LIMIT, err
+    );
+    let event = BackendErrorEvent {
+        message,
+        fallback_mode: Some("local".to_string()),
+    };
+
+    if let Err(emit_err) = app_handle.emit("backend-error", &event) {
+        error!("Failed to emit backend-error event: {}", emit_err);
+    }
+
+    error!(
+        "Switched transcription backend to local after {} consecutive API failures (source: {}, last_error: {})",
+        API_STREAM_FAILURE_LIMIT,
+        source,
+        err
+    );
+}
+
 pub(crate) async fn list_audio_devices_impl() -> Result<Vec<AudioDevice>, String> {
     let host = cpal::default_host();
     let default_device_name = host.default_input_device().and_then(|d| d.name().ok());
@@ -390,6 +448,7 @@ pub(crate) async fn set_transcription_backend_config_impl(
 
     state_guard.transcription_mode = mode.clone();
     drop(state_guard);
+    API_STREAM_FAILURE_STREAK.store(0, Ordering::Relaxed);
 
     if switched_local_to_api {
         system_audio::finalize_active_system_audio_session("mode_switch_local_to_api");

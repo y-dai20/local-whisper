@@ -203,6 +203,9 @@ pub async fn start_mic_stream(app_handle: AppHandle, language: Option<String>) -
                             &app_handle_clone,
                         ) {
                             error!("Failed to stream mic audio chunk to API: {}", err);
+                            crate::handle_api_stream_failure(&app_handle_clone, "user", &err);
+                        } else {
+                            crate::mark_api_stream_success();
                         }
                     }
                 },

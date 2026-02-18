@@ -132,6 +132,9 @@ extern "C" fn audio_callback(samples: *const f32, count: c_int) {
                     app,
                 ) {
                     error!("Failed to stream system audio chunk to API: {}", err);
+                    crate::handle_api_stream_failure(app, "system", &err);
+                } else {
+                    crate::mark_api_stream_success();
                 }
             }
         } else {
