@@ -72,7 +72,7 @@ pub static WHISPER_PARAMS: OnceCell<Arc<ParkingMutex<WhisperParams>>> = OnceCell
 pub const REMOTE_MODELS: &[RemoteModel] = &[
     RemoteModel {
         id: "base",
-        name: "Whisper Base",
+        name: "Base",
         filename: "ggml-base.bin",
         size: 74_438_528,
         description: "英語・多言語兼用 / 約 74 MB",
@@ -80,7 +80,7 @@ pub const REMOTE_MODELS: &[RemoteModel] = &[
     },
     RemoteModel {
         id: "small",
-        name: "Whisper Small",
+        name: "Small",
         filename: "ggml-small.bin",
         size: 244_452_544,
         description: "中規模モデル / 約 244 MB",
@@ -88,7 +88,7 @@ pub const REMOTE_MODELS: &[RemoteModel] = &[
     },
     RemoteModel {
         id: "medium",
-        name: "Whisper Medium",
+        name: "Medium",
         filename: "ggml-medium.bin",
         size: 769_073_152,
         description: "高精度モデル / 約 769 MB",
@@ -96,7 +96,7 @@ pub const REMOTE_MODELS: &[RemoteModel] = &[
     },
     RemoteModel {
         id: "large-v3-turbo",
-        name: "Whisper Large v3 Turbo",
+        name: "Large v3 Turbo",
         filename: "ggml-large-v3-turbo.bin",
         size: 3_085_627_392,
         description: "最新 Large モデル / 約 3.1 GB",

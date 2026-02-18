@@ -19,6 +19,7 @@ import {
   ChevronUp,
   X,
 } from "lucide-react";
+import { TypingDots } from "./components/TypingDots";
 import "./App.css";
 
 interface TranscriptionSegment {
@@ -142,7 +143,7 @@ function App() {
   });
   const [isSavingStreamingConfig, setIsSavingStreamingConfig] = useState(false);
   const [whisperParams, setWhisperParams] = useState<WhisperParamsConfig>({
-    audioCtx: 1000,
+    audioCtx: 1500,
     temperature: 0,
   });
   const [isSavingWhisperParams, setIsSavingWhisperParams] = useState(false);
@@ -172,20 +173,33 @@ function App() {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const previousMessageCountRef = useRef(0);
   const previousScrollHeightRef = useRef(0);
+  const selectedModelInfo = availableModels.find(
+    (model) => model.path === selectedModel,
+  );
+  const selectedModelDisplayName =
+    selectedModelInfo?.name?.trim() ||
+    selectedModelInfo?.path ||
+    selectedModel;
 
   const upsertTranscriptionSegment = useCallback(
     (segment: TranscriptionSegment) => {
       setTranscriptions((prev) => {
         const sessionKey = `${segment.source}-${segment.sessionId}`;
         const sessions = [...prev];
-        const sessionIndex = sessions.findIndex((s) => s.sessionKey === sessionKey);
+        const sessionIndex = sessions.findIndex(
+          (s) => s.sessionKey === sessionKey,
+        );
 
-        const upsertMessages = (existing: TranscriptionSegment[] | undefined) => {
+        const upsertMessages = (
+          existing: TranscriptionSegment[] | undefined,
+        ) => {
           if (!existing) {
             return [segment];
           }
           const messages = [...existing];
-          const messageIndex = messages.findIndex((m) => m.messageId === segment.messageId);
+          const messageIndex = messages.findIndex(
+            (m) => m.messageId === segment.messageId,
+          );
           if (messageIndex >= 0) {
             messages[messageIndex] = segment;
           } else {
@@ -195,7 +209,9 @@ function App() {
           return messages;
         };
 
-        const upsertAudioChunks = (existing: Record<number, number[]> | undefined) => {
+        const upsertAudioChunks = (
+          existing: Record<number, number[]> | undefined,
+        ) => {
           const chunks = { ...(existing || {}) };
           if (segment.audioData?.length) {
             chunks[segment.messageId] = segment.audioData;
@@ -728,7 +744,9 @@ function App() {
     }
 
     if (isAutoScrollPaused) {
-      setNewMessageCount((prev) => prev + (incomingCount > 0 ? incomingCount : 1));
+      setNewMessageCount(
+        (prev) => prev + (incomingCount > 0 ? incomingCount : 1),
+      );
       return;
     }
 
@@ -1495,7 +1513,7 @@ function App() {
                             <span className="flex-1 text-left">
                               {message.text}
                               {!message.isFinal && (
-                                <span className="loading loading-dots loading-xs ml-1 align-bottom"></span>
+                                <TypingDots inline className="ml-1" />
                               )}
                             </span>
                           </div>
@@ -1552,14 +1570,14 @@ function App() {
                 {showUserActivityIndicator && (
                   <div className="chat chat-end">
                     <div className="chat-bubble chat-bubble-primary opacity-70 text-sm">
-                      <span className="loading loading-dots loading-xs"></span>
+                      <TypingDots className="mx-auto" />
                     </div>
                   </div>
                 )}
                 {showSystemActivityIndicator && (
                   <div className="chat chat-start">
                     <div className="chat-bubble chat-bubble-secondary opacity-70 text-sm">
-                      <span className="loading loading-dots loading-xs"></span>
+                      <TypingDots className="mx-auto" />
                     </div>
                   </div>
                 )}
@@ -1624,10 +1642,15 @@ function App() {
                     >
                       {availableModels.map((model) => (
                         <option key={model.path} value={model.path}>
-                          {model.name}
+                          {model.name?.trim() || model.path}
                         </option>
                       ))}
                     </select>
+                    {selectedModel && (
+                      <p className="text-xs opacity-60 mt-2 break-all">
+                        使用中: {selectedModelDisplayName}
+                      </p>
+                    )}
                   </div>
 
                   <div className="space-y-3">
