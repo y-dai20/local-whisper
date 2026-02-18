@@ -32,7 +32,7 @@ use transcription::TranscriptionSegment;
 use transcription::worker::stop_transcription_worker;
 
 static RECORDING_SAVE_PATH: OnceCell<Arc<ParkingMutex<Option<String>>>> = OnceCell::new();
-static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
+pub(crate) static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 static SHUTDOWN_CLEANED: AtomicBool = AtomicBool::new(false);
 static API_STREAM_FAILURE_STREAK: AtomicU32 = AtomicU32::new(0);
 const API_STREAM_FAILURE_LIMIT: u32 = 10;

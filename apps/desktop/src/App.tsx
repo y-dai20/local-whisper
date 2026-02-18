@@ -100,6 +100,16 @@ interface BackendErrorEvent {
   fallbackMode?: "local" | "api";
 }
 
+interface ModelInstallProgressEvent {
+  modelId: string;
+  filename: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  percent: number;
+  status: "downloading" | "completed" | "error";
+  message?: string;
+}
+
 const API_BASE_URL =
   (import.meta.env.VITE_ASR_API_BASE_URL as string | undefined)?.trim() || "";
 
@@ -133,6 +143,9 @@ function App() {
   const [remoteModels, setRemoteModels] = useState<RemoteModelStatus[]>([]);
   const [modelOperations, setModelOperations] = useState<
     Record<string, boolean>
+  >({});
+  const [modelInstallProgress, setModelInstallProgress] = useState<
+    Record<string, ModelInstallProgressEvent>
   >({});
   const [isLoadingRemoteModels, setIsLoadingRemoteModels] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -180,6 +193,8 @@ function App() {
     selectedModelInfo?.name?.trim() ||
     selectedModelInfo?.path ||
     selectedModel;
+  const needsModelSetup =
+    transcriptionMode === "local" && availableModels.length === 0;
 
   const upsertTranscriptionSegment = useCallback(
     (segment: TranscriptionSegment) => {
@@ -676,6 +691,17 @@ function App() {
       },
     );
 
+    const unlistenModelInstallProgress = listen<ModelInstallProgressEvent>(
+      "model-install-progress",
+      (event) => {
+        const progress = event.payload;
+        setModelInstallProgress((prev) => ({
+          ...prev,
+          [progress.modelId]: progress,
+        }));
+      },
+    );
+
     loadSettingsFromLocalStorage();
     refreshAllModels();
     loadLanguages();
@@ -691,6 +717,7 @@ function App() {
       unlistenTranscription.then((fn) => fn());
       unlistenVoiceActivity.then((fn) => fn());
       unlistenBackendError.then((fn) => fn());
+      unlistenModelInstallProgress.then((fn) => fn());
     };
   }, [
     finalizeAllInProgressMessages,
@@ -945,6 +972,17 @@ function App() {
 
   const handleInstallModel = async (modelId: string) => {
     setModelOperations((prev) => ({ ...prev, [modelId]: true }));
+    setModelInstallProgress((prev) => ({
+      ...prev,
+      [modelId]: {
+        modelId,
+        filename: "",
+        downloadedBytes: 0,
+        totalBytes: 1,
+        percent: 0,
+        status: "downloading",
+      },
+    }));
     try {
       await invoke<ModelInfo>("install_model", { modelId });
       await refreshAllModels();
@@ -979,6 +1017,18 @@ function App() {
 
   const formatModelSize = (bytes: number) => {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const formatInstallProgress = (progress?: ModelInstallProgressEvent) => {
+    if (!progress) {
+      return "";
+    }
+    const total = progress.totalBytes > 0 ? progress.totalBytes : 1;
+    const percent = Math.max(
+      0,
+      Math.min(100, Number.isFinite(progress.percent) ? progress.percent : 0),
+    );
+    return `${percent.toFixed(1)}% (${formatModelSize(progress.downloadedBytes)} / ${formatModelSize(total)})`;
   };
 
   const initializeWhisper = async () => {
@@ -1467,9 +1517,93 @@ function App() {
               </div>
             )}
 
-            {transcriptions.length === 0 &&
-            !voiceActivity.user.isActive &&
-            !voiceActivity.system.isActive ? (
+            {needsModelSetup ? (
+              <div className="max-w-3xl mx-auto border border-base-300 rounded-xl p-4 bg-base-200/50 space-y-4">
+                <div>
+                  <p className="text-sm font-semibold">
+                    まず Whisper モデルをインストールしてください
+                  </p>
+                  <p className="text-xs opacity-70 mt-1">
+                    ローカルモードではモデルがないとマイク文字起こしを開始できません。下から1つ選んでインストールしてください。
+                  </p>
+                </div>
+
+                {isLoadingRemoteModels ? (
+                  <div className="flex items-center gap-2 text-sm">
+                    <span className="loading loading-spinner loading-xs"></span>
+                    モデル一覧を読み込み中...
+                  </div>
+                ) : remoteModels.length === 0 ? (
+                  <p className="text-sm opacity-70">
+                    利用可能なモデル一覧を取得できませんでした。設定画面の「モデル設定」から再読み込みしてください。
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    {remoteModels.map((model) => {
+                      const progress = modelInstallProgress[model.id];
+                      const isInstalling = modelOperations[model.id];
+                      const showProgress =
+                        isInstalling && progress?.status === "downloading";
+                      return (
+                        <div
+                          key={model.id}
+                          className="border border-base-300 rounded-xl p-3 flex items-start justify-between gap-3"
+                        >
+                          <div>
+                            <p className="font-medium text-sm">{model.name}</p>
+                            <p className="text-xs opacity-70">
+                              {model.description}
+                            </p>
+                            <p className="text-xs opacity-60 mt-1">
+                              {formatModelSize(model.size)}
+                            </p>
+                            {showProgress && (
+                              <div className="mt-2 space-y-1">
+                                <progress
+                                  className="progress progress-primary w-40"
+                                  value={Math.max(
+                                    0,
+                                    Math.min(
+                                      100,
+                                      Number.isFinite(progress.percent)
+                                        ? progress.percent
+                                        : 0,
+                                    ),
+                                  )}
+                                  max={100}
+                                />
+                                <p className="text-[11px] opacity-70">
+                                  {formatInstallProgress(progress)}
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                          <button
+                            className={`btn btn-xs ${model.installed ? "btn-outline" : "btn-primary"}`}
+                            onClick={() =>
+                              model.installed && model.path
+                                ? setSelectedModel(model.path)
+                                : handleInstallModel(model.id)
+                            }
+                            disabled={isInstalling}
+                          >
+                            {isInstalling
+                              ? progress?.status === "downloading"
+                                ? "ダウンロード中..."
+                                : "処理中..."
+                              : model.installed
+                                ? "使用する"
+                                : "インストール"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ) : transcriptions.length === 0 &&
+              !voiceActivity.user.isActive &&
+              !voiceActivity.system.isActive ? (
               <div className="flex-1 flex flex-col items-center justify-center text-center text-base-content/30 min-h-[50vh]">
                 <MessageSquare className="w-16 h-16 mb-4 opacity-20" />
                 <p className="text-sm font-medium">
@@ -1678,72 +1812,100 @@ function App() {
                           利用可能なモデルが見つかりません
                         </p>
                       ) : (
-                        remoteModels.map((model) => (
-                          <div
-                            key={model.id}
-                            className="border border-base-300 rounded-xl p-3 flex flex-col gap-2"
-                          >
-                            <div className="flex items-start justify-between gap-3">
-                              <div>
-                                <p className="font-medium text-sm">
-                                  {model.name}
-                                </p>
-                                <p className="text-xs opacity-70">
-                                  {model.description}
-                                </p>
-                                <p className="text-xs opacity-60 mt-1">
-                                  {formatModelSize(model.size)}
-                                </p>
-                                {model.installed && model.path && (
-                                  <p className="text-[11px] opacity-50 mt-1 break-all">
-                                    {model.path}
+                        remoteModels.map((model) => {
+                          const progress = modelInstallProgress[model.id];
+                          const isInstalling = modelOperations[model.id];
+                          const showProgress =
+                            isInstalling && progress?.status === "downloading";
+                          return (
+                            <div
+                              key={model.id}
+                              className="border border-base-300 rounded-xl p-3 flex flex-col gap-2"
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <p className="font-medium text-sm">
+                                    {model.name}
                                   </p>
-                                )}
-                              </div>
-                              <div className="flex flex-row flex-wrap gap-2 items-center justify-end">
-                                {model.installed ? (
-                                  <>
+                                  <p className="text-xs opacity-70">
+                                    {model.description}
+                                  </p>
+                                  <p className="text-xs opacity-60 mt-1">
+                                    {formatModelSize(model.size)}
+                                  </p>
+                                  {showProgress && (
+                                    <div className="mt-2 space-y-1">
+                                      <progress
+                                        className="progress progress-primary w-40"
+                                        value={Math.max(
+                                          0,
+                                          Math.min(
+                                            100,
+                                            Number.isFinite(progress.percent)
+                                              ? progress.percent
+                                              : 0,
+                                          ),
+                                        )}
+                                        max={100}
+                                      />
+                                      <p className="text-[11px] opacity-70">
+                                        {formatInstallProgress(progress)}
+                                      </p>
+                                    </div>
+                                  )}
+                                  {model.installed && model.path && (
+                                    <p className="text-[11px] opacity-50 mt-1 break-all">
+                                      {model.path}
+                                    </p>
+                                  )}
+                                </div>
+                                <div className="flex flex-row flex-wrap gap-2 items-center justify-end">
+                                  {model.installed ? (
+                                    <>
+                                      <button
+                                        className="btn btn-xs btn-outline text-[11px]"
+                                        disabled={
+                                          selectedModel === model.path ||
+                                          !model.path ||
+                                          modelOperations[model.id]
+                                        }
+                                        onClick={() =>
+                                          model.path &&
+                                          setSelectedModel(model.path)
+                                        }
+                                      >
+                                        {selectedModel === model.path
+                                          ? "使用中"
+                                          : "使用する"}
+                                      </button>
+                                      <button
+                                        className="btn btn-xs btn-error text-[11px]"
+                                        onClick={() => handleDeleteModel(model)}
+                                        disabled={modelOperations[model.id]}
+                                      >
+                                        {modelOperations[model.id]
+                                          ? "削除中..."
+                                          : "削除"}
+                                      </button>
+                                    </>
+                                  ) : (
                                     <button
-                                      className="btn btn-xs btn-outline text-[11px]"
-                                      disabled={
-                                        selectedModel === model.path ||
-                                        !model.path ||
-                                        modelOperations[model.id]
-                                      }
-                                      onClick={() =>
-                                        model.path &&
-                                        setSelectedModel(model.path)
-                                      }
-                                    >
-                                      {selectedModel === model.path
-                                        ? "使用中"
-                                        : "使用する"}
-                                    </button>
-                                    <button
-                                      className="btn btn-xs btn-error text-[11px]"
-                                      onClick={() => handleDeleteModel(model)}
+                                      className="btn btn-xs btn-primary text-[11px]"
+                                      onClick={() => handleInstallModel(model.id)}
                                       disabled={modelOperations[model.id]}
                                     >
                                       {modelOperations[model.id]
-                                        ? "削除中..."
-                                        : "削除"}
+                                        ? progress?.status === "downloading"
+                                          ? "ダウンロード中..."
+                                          : "インストール中..."
+                                        : "インストール"}
                                     </button>
-                                  </>
-                                ) : (
-                                  <button
-                                    className="btn btn-xs btn-primary text-[11px]"
-                                    onClick={() => handleInstallModel(model.id)}
-                                    disabled={modelOperations[model.id]}
-                                  >
-                                    {modelOperations[model.id]
-                                      ? "インストール中..."
-                                      : "インストール"}
-                                  </button>
-                                )}
+                                  )}
+                                </div>
                               </div>
                             </div>
-                          </div>
-                        ))
+                          );
+                        })
                       )}
                     </div>
                   </div>

@@ -6,11 +6,13 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::audio::constants::{self, VAD_SAMPLE_RATE};
 use crate::audio::state::try_recording_state;
+use crate::APP_HANDLE;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelInfo {
@@ -69,6 +71,21 @@ pub struct RemoteModel {
 pub static WHISPER_CTX: OnceCell<Arc<Mutex<Option<WhisperContext>>>> = OnceCell::new();
 pub static WHISPER_PARAMS: OnceCell<Arc<ParkingMutex<WhisperParams>>> = OnceCell::new();
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ModelInstallProgressEvent {
+    #[serde(rename = "modelId")]
+    model_id: String,
+    filename: String,
+    #[serde(rename = "downloadedBytes")]
+    downloaded_bytes: u64,
+    #[serde(rename = "totalBytes")]
+    total_bytes: u64,
+    percent: f32,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
 pub const REMOTE_MODELS: &[RemoteModel] = &[
     RemoteModel {
         id: "base",
@@ -105,6 +122,42 @@ pub const REMOTE_MODELS: &[RemoteModel] = &[
 ];
 
 fn model_directory() -> Result<PathBuf, String> {
+    if let Ok(custom_dir) = std::env::var("LOCAL_WHISPER_MODEL_DIR") {
+        let trimmed = custom_dir.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME")
+            .map_err(|_| "Failed to resolve HOME for model directory".to_string())?;
+        return Ok(PathBuf::from(home).join("Library/Application Support/local-whisper/models"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| "Failed to resolve APPDATA for model directory".to_string())?;
+        return Ok(PathBuf::from(appdata).join("local-whisper/models"));
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
+            let trimmed = xdg_data_home.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed).join("local-whisper/models"));
+            }
+        }
+        let home = std::env::var("HOME")
+            .map_err(|_| "Failed to resolve HOME for model directory".to_string())?;
+        Ok(PathBuf::from(home).join(".local/share/local-whisper/models"))
+    }
+}
+
+fn legacy_model_directory() -> Result<PathBuf, String> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -113,29 +166,46 @@ fn model_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "Failed to resolve model directory".to_string())
 }
 
+fn model_directories_for_scan() -> Result<Vec<PathBuf>, String> {
+    let primary = model_directory()?;
+    let legacy = legacy_model_directory()?;
+    if primary == legacy {
+        Ok(vec![primary])
+    } else {
+        Ok(vec![primary, legacy])
+    }
+}
+
 fn read_installed_models() -> Result<Vec<ModelInfo>, String> {
     let mut models = Vec::new();
-    let model_dir = model_directory()?;
+    let mut seen_paths = std::collections::HashSet::new();
 
-    if !model_dir.exists() {
-        return Ok(models);
-    }
+    for model_dir in model_directories_for_scan()? {
+        if !model_dir.exists() {
+            continue;
+        }
 
-    let entries = std::fs::read_dir(&model_dir)
-        .map_err(|e| format!("Failed to read model directory: {}", e))?;
+        let entries = std::fs::read_dir(&model_dir)
+            .map_err(|e| format!("Failed to read model directory: {}", e))?;
 
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if let Some(filename) = path.file_name() {
-                let filename_str = filename.to_string_lossy();
-                if filename_str.starts_with("ggml-") && filename_str.ends_with(".bin") {
-                    if let Ok(metadata) = entry.metadata() {
-                        models.push(ModelInfo {
-                            name: filename_str.to_string(),
-                            path: path.to_string_lossy().to_string(),
-                            size: metadata.len(),
-                        });
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if let Some(filename) = path.file_name() {
+                    let filename_str = filename.to_string_lossy();
+                    if filename_str.starts_with("ggml-") && filename_str.ends_with(".bin") {
+                        let path_str = path.to_string_lossy().to_string();
+                        if seen_paths.contains(&path_str) {
+                            continue;
+                        }
+                        if let Ok(metadata) = entry.metadata() {
+                            seen_paths.insert(path_str.clone());
+                            models.push(ModelInfo {
+                                name: filename_str.to_string(),
+                                path: path_str,
+                                size: metadata.len(),
+                            });
+                        }
                     }
                 }
             }
@@ -144,6 +214,12 @@ fn read_installed_models() -> Result<Vec<ModelInfo>, String> {
 
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(models)
+}
+
+fn emit_model_install_progress(app_handle: Option<&AppHandle>, event: &ModelInstallProgressEvent) {
+    if let Some(app) = app_handle {
+        let _ = app.emit("model-install-progress", event);
+    }
 }
 
 fn whisper_params_state() -> Arc<ParkingMutex<WhisperParams>> {
@@ -238,20 +314,63 @@ pub async fn list_remote_models_impl() -> Result<Vec<RemoteModelStatus>, String>
 }
 
 pub async fn install_model_impl(model_id: String) -> Result<ModelInfo, String> {
+    let app_handle = APP_HANDLE.get();
     let model = REMOTE_MODELS
         .iter()
-        .find(|m| m.id == model_id)
+        .find(|m| m.id == model_id.as_str())
         .ok_or_else(|| "Unknown model id".to_string())?;
+
+    let total_bytes = model.size;
+    emit_model_install_progress(
+        app_handle,
+        &ModelInstallProgressEvent {
+            model_id: model_id.clone(),
+            filename: model.filename.to_string(),
+            downloaded_bytes: 0,
+            total_bytes,
+            percent: 0.0,
+            status: "downloading".to_string(),
+            message: None,
+        },
+    );
 
     let dir = model_directory()?;
     if !dir.exists() {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create model dir: {}", e))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| {
+                let message = format!("Failed to create model dir {}: {}", dir.display(), e);
+                emit_model_install_progress(
+                    app_handle,
+                    &ModelInstallProgressEvent {
+                        model_id: model_id.clone(),
+                        filename: model.filename.to_string(),
+                        downloaded_bytes: 0,
+                        total_bytes,
+                        percent: 0.0,
+                        status: "error".to_string(),
+                        message: Some(message.clone()),
+                    },
+                );
+                message
+            })?;
     }
 
     let target_path = dir.join(model.filename);
     if target_path.exists() {
         let metadata = std::fs::metadata(&target_path)
             .map_err(|e| format!("Failed to read existing model metadata: {}", e))?;
+        emit_model_install_progress(
+            app_handle,
+            &ModelInstallProgressEvent {
+                model_id: model_id.clone(),
+                filename: model.filename.to_string(),
+                downloaded_bytes: metadata.len(),
+                total_bytes: metadata.len(),
+                percent: 100.0,
+                status: "completed".to_string(),
+                message: None,
+            },
+        );
         return Ok(ModelInfo {
             name: model.filename.to_string(),
             path: target_path.to_string_lossy().to_string(),
@@ -265,35 +384,179 @@ pub async fn install_model_impl(model_id: String) -> Result<ModelInfo, String> {
         .get(model.url)
         .send()
         .await
-        .map_err(|e| format!("Failed to download model: {}", e))?;
+        .map_err(|e| {
+            let message = format!("Failed to download model: {}", e);
+            emit_model_install_progress(
+                app_handle,
+                &ModelInstallProgressEvent {
+                    model_id: model_id.clone(),
+                    filename: model.filename.to_string(),
+                    downloaded_bytes: 0,
+                    total_bytes,
+                    percent: 0.0,
+                    status: "error".to_string(),
+                    message: Some(message.clone()),
+                },
+            );
+            message
+        })?;
 
     if !response.status().is_success() {
-        return Err(format!("Download failed with status {}", response.status()));
+        let message = format!("Download failed with status {}", response.status());
+        emit_model_install_progress(
+            app_handle,
+            &ModelInstallProgressEvent {
+                model_id: model_id.clone(),
+                filename: model.filename.to_string(),
+                downloaded_bytes: 0,
+                total_bytes,
+                percent: 0.0,
+                status: "error".to_string(),
+                message: Some(message.clone()),
+            },
+        );
+        return Err(message);
     }
 
     let mut file = fs::File::create(&tmp_path)
         .await
-        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+        .map_err(|e| {
+            let message = format!("Failed to create temp file: {}", e);
+            emit_model_install_progress(
+                app_handle,
+                &ModelInstallProgressEvent {
+                    model_id: model_id.clone(),
+                    filename: model.filename.to_string(),
+                    downloaded_bytes: 0,
+                    total_bytes,
+                    percent: 0.0,
+                    status: "error".to_string(),
+                    message: Some(message.clone()),
+                },
+            );
+            message
+        })?;
+
+    let expected_total = response.content_length().unwrap_or(total_bytes).max(1);
+    let mut downloaded_bytes: u64 = 0;
+    let mut last_notified_bytes: u64 = 0;
 
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| format!("Failed to read download chunk: {}", e))?
+        .map_err(|e| {
+            let message = format!("Failed to read download chunk: {}", e);
+            emit_model_install_progress(
+                app_handle,
+                &ModelInstallProgressEvent {
+                    model_id: model_id.clone(),
+                    filename: model.filename.to_string(),
+                    downloaded_bytes,
+                    total_bytes: expected_total,
+                    percent: ((downloaded_bytes as f64 / expected_total as f64) * 100.0) as f32,
+                    status: "error".to_string(),
+                    message: Some(message.clone()),
+                },
+            );
+            message
+        })?
     {
+        downloaded_bytes += chunk.len() as u64;
         file.write_all(chunk.as_ref())
             .await
-            .map_err(|e| format!("Failed to write chunk: {}", e))?;
+            .map_err(|e| {
+                let message = format!("Failed to write chunk: {}", e);
+                emit_model_install_progress(
+                    app_handle,
+                    &ModelInstallProgressEvent {
+                        model_id: model_id.clone(),
+                        filename: model.filename.to_string(),
+                        downloaded_bytes,
+                        total_bytes: expected_total,
+                        percent: ((downloaded_bytes as f64 / expected_total as f64) * 100.0)
+                            as f32,
+                        status: "error".to_string(),
+                        message: Some(message.clone()),
+                    },
+                );
+                message
+            })?;
+
+        if downloaded_bytes.saturating_sub(last_notified_bytes) >= 1_048_576
+            || downloaded_bytes == expected_total
+        {
+            let percent = ((downloaded_bytes as f64 / expected_total as f64) * 100.0)
+                .min(100.0) as f32;
+            emit_model_install_progress(
+                app_handle,
+                &ModelInstallProgressEvent {
+                    model_id: model_id.clone(),
+                    filename: model.filename.to_string(),
+                    downloaded_bytes,
+                    total_bytes: expected_total,
+                    percent,
+                    status: "downloading".to_string(),
+                    message: None,
+                },
+            );
+            last_notified_bytes = downloaded_bytes;
+        }
     }
     file.flush()
         .await
-        .map_err(|e| format!("Failed to flush download: {}", e))?;
+        .map_err(|e| {
+            let message = format!("Failed to flush download: {}", e);
+            emit_model_install_progress(
+                app_handle,
+                &ModelInstallProgressEvent {
+                    model_id: model_id.clone(),
+                    filename: model.filename.to_string(),
+                    downloaded_bytes,
+                    total_bytes: expected_total,
+                    percent: ((downloaded_bytes as f64 / expected_total as f64) * 100.0)
+                        .min(100.0) as f32,
+                    status: "error".to_string(),
+                    message: Some(message.clone()),
+                },
+            );
+            message
+        })?;
 
     fs::rename(&tmp_path, &target_path)
         .await
-        .map_err(|e| format!("Failed to move downloaded model: {}", e))?;
+        .map_err(|e| {
+            let message = format!("Failed to move downloaded model: {}", e);
+            emit_model_install_progress(
+                app_handle,
+                &ModelInstallProgressEvent {
+                    model_id: model_id.clone(),
+                    filename: model.filename.to_string(),
+                    downloaded_bytes,
+                    total_bytes: expected_total,
+                    percent: ((downloaded_bytes as f64 / expected_total as f64) * 100.0)
+                        .min(100.0) as f32,
+                    status: "error".to_string(),
+                    message: Some(message.clone()),
+                },
+            );
+            message
+        })?;
 
     let metadata = std::fs::metadata(&target_path)
         .map_err(|e| format!("Failed to read model metadata: {}", e))?;
+
+    emit_model_install_progress(
+        app_handle,
+        &ModelInstallProgressEvent {
+            model_id,
+            filename: model.filename.to_string(),
+            downloaded_bytes: metadata.len(),
+            total_bytes: metadata.len(),
+            percent: 100.0,
+            status: "completed".to_string(),
+            message: None,
+        },
+    );
 
     Ok(ModelInfo {
         name: model.filename.to_string(),
@@ -303,10 +566,6 @@ pub async fn install_model_impl(model_id: String) -> Result<ModelInfo, String> {
 }
 
 pub async fn delete_model_impl(model_path: String) -> Result<(), String> {
-    let dir = model_directory()?;
-    let canonical_dir =
-        std::fs::canonicalize(&dir).map_err(|e| format!("Failed to resolve model dir: {}", e))?;
-
     let target_path = PathBuf::from(&model_path);
     if !target_path.exists() {
         return Ok(());
@@ -315,7 +574,15 @@ pub async fn delete_model_impl(model_path: String) -> Result<(), String> {
     let canonical_target = std::fs::canonicalize(&target_path)
         .map_err(|e| format!("Failed to resolve target path: {}", e))?;
 
-    if !canonical_target.starts_with(&canonical_dir) {
+    let allowed_dirs: Vec<PathBuf> = model_directories_for_scan()?
+        .into_iter()
+        .filter_map(|dir| std::fs::canonicalize(&dir).ok())
+        .collect();
+
+    if !allowed_dirs
+        .iter()
+        .any(|allowed_dir| canonical_target.starts_with(allowed_dir))
+    {
         return Err("Invalid model path".to_string());
     }
 
