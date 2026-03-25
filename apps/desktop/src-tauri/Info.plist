@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>このアプリは音声を文字起こしするためにマイクへのアクセスが必要です。</string>
+  <string>This app needs microphone access to transcribe audio.</string>
 
-  <!-- システム音声拾う/画面収録系を将来やるなら（必要時だけ） -->
+  <!-- Screen/system audio capture (enable when needed) -->
   <!-- <key>NSCameraUsageDescription</key>
-  <string>（必要なら）</string> -->
+  <string>(if needed)</string> -->
 </dict>
 </plist>
