@@ -349,7 +349,7 @@ pub(crate) fn handle_api_stream_failure(app_handle: &AppHandle, source: &str, er
     transcription::api_client::reset_all_connections(APP_HANDLE.get());
 
     let message = format!(
-        "API接続に{}回連続で失敗したため、Proモードをローカルモードに切り替えました。最後のエラー: {}",
+        "Switched to local mode after {} consecutive API failures. Last error: {}",
         API_STREAM_FAILURE_LIMIT, err
     );
     let event = BackendErrorEvent {
@@ -633,17 +633,17 @@ pub(crate) async fn get_screen_recording_status_impl() -> Result<bool, String> {
 
 pub(crate) async fn get_supported_languages_impl() -> Result<Vec<(String, String)>, String> {
     Ok(vec![
-        ("auto".to_string(), "自動検出".to_string()),
-        ("ja".to_string(), "日本語".to_string()),
+        ("auto".to_string(), "Auto-detect".to_string()),
+        ("ja".to_string(), "Japanese".to_string()),
         ("en".to_string(), "English".to_string()),
-        ("zh".to_string(), "中文".to_string()),
-        ("ko".to_string(), "한국어".to_string()),
-        ("es".to_string(), "Español".to_string()),
-        ("fr".to_string(), "Français".to_string()),
+        ("zh".to_string(), "Chinese".to_string()),
+        ("ko".to_string(), "Korean".to_string()),
+        ("es".to_string(), "Spanish".to_string()),
+        ("fr".to_string(), "French".to_string()),
         ("de".to_string(), "Deutsch".to_string()),
-        ("it".to_string(), "Italiano".to_string()),
-        ("pt".to_string(), "Português".to_string()),
-        ("ru".to_string(), "Русский".to_string()),
+        ("it".to_string(), "Italian".to_string()),
+        ("pt".to_string(), "Portuguese".to_string()),
+        ("ru".to_string(), "Russian".to_string()),
     ])
 }
 

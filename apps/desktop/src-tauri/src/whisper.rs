@@ -92,7 +92,7 @@ pub const REMOTE_MODELS: &[RemoteModel] = &[
         name: "Base",
         filename: "ggml-base.bin",
         size: 74_438_528,
-        description: "英語・多言語兼用 / 約 74 MB",
+        description: "Multilingual / ~74 MB",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
     },
     RemoteModel {
@@ -100,7 +100,7 @@ pub const REMOTE_MODELS: &[RemoteModel] = &[
         name: "Small",
         filename: "ggml-small.bin",
         size: 244_452_544,
-        description: "中規模モデル / 約 244 MB",
+        description: "Mid-size model / ~244 MB",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
     },
     RemoteModel {
@@ -108,7 +108,7 @@ pub const REMOTE_MODELS: &[RemoteModel] = &[
         name: "Medium",
         filename: "ggml-medium.bin",
         size: 769_073_152,
-        description: "高精度モデル / 約 769 MB",
+        description: "High-accuracy model / ~769 MB",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
     },
     RemoteModel {
@@ -116,7 +116,7 @@ pub const REMOTE_MODELS: &[RemoteModel] = &[
         name: "Large v3 Turbo",
         filename: "ggml-large-v3-turbo.bin",
         size: 3_085_627_392,
-        description: "最新 Large モデル / 約 3.1 GB",
+        description: "Latest Large model / ~3.1 GB",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
     },
 ];
