@@ -3,7 +3,7 @@
 [🇯🇵 日本語版 README](./README.ja.md)
 
 [![Blog](https://img.shields.io/badge/blog-neosophie.com-blue)](https://neosophie.com/en/blog/20260218-local-whisper)
-[![Website](https://img.shields.io/badge/website-neosophie.com-black)](https://neosophie.com)
+[![Website](https://img.shields.io/badge/website-neosophie.com-green)](https://neosophie.com)
 
 Local Whisper is a high-accuracy, low-latency transcription app that runs entirely on Apple Silicon (M1/M2/M3).
 It captures both microphone input and system audio (e.g., web meetings, YouTube) without sending data to the cloud.
