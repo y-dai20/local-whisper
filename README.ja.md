@@ -1,5 +1,9 @@
 # Local Whisper
 
+
+[![Blog](https://img.shields.io/badge/blog-neosophie.com-blue)](https://neosophie.com/en/blog/20260218-local-whisper)
+[![Website](https://img.shields.io/badge/website-neosophie.com-green)](https://neosophie.com)
+
 Apple Silicon (M1/M2/M3) 向けに最適化した、完全ローカル動作の高精度・低遅延文字起こしアプリです。
 Web 会議や YouTube などのシステム音声も、マイク入力も、そのままテキスト化できます。
 
